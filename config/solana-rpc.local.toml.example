@@ -1,0 +1,121 @@
+# Copy this to config/solana-rpc.local.toml.  That filename is ignored by git.
+# Do not put the endpoint/key into a chat message or a tracked TOML file.
+#
+# Before starting the scanner in the same shell, set two local variables:
+#   export SOLANA_RPC_HTTP_URL='https://...'
+#   export SOLANA_RPC_WS_URL='wss://...'
+
+[scanner]
+retention_seconds = 180
+max_events_per_key = 4096
+event_bus_capacity = 8192
+status_flush_seconds = 2
+
+[solana]
+rpc_http_url_env = "SOLANA_RPC_HTTP_URL"
+rpc_ws_url_env = "SOLANA_RPC_WS_URL"
+timeout_seconds = 10
+
+[jupiter]
+# This is used only later for gated aggregator-route verification, never as a
+# high-frequency feed.  Keep the key in an environment variable or a local,
+# ignored TOML file.  The scanner never persists its value.
+# api_key_env = "JUPITER_API_KEY"
+minimum_request_interval_seconds = 2.05
+
+[evm]
+# Optional: a dedicated Base RPC URL is needed for sustained Uniswap V3
+# exact-quote polling.  The public Base fallback is deliberately rate-limited
+# and the scanner will circuit-break it after repeated quota responses.
+# Put a provider URL in this ignored local file, or preferably use an env var:
+# base_rpc_http_url_env = "BASE_RPC_HTTP_URL"
+# polygon_rpc_http_url_env = "POLYGON_RPC_HTTP_URL"
+
+[raydium_local_quote_worker]
+# Set true once the local TypeScript SDK worker has been smoke-tested.  It is
+# a managed child of `run-unified-solana-scanner`, not a separate tmux process.
+enabled = false
+tick_cache_max_age_ms = 300000
+# WebSocket remains the hot path. This low-rate batch snapshot confirms quiet
+# pools and repairs a missed account notification without quote-API polling.
+state_snapshot_refresh_interval_ms = 15000
+# At most five Solana HTTP RPC request starts per second across every local
+# protocol engine. WebSocket push updates are not throttled by this setting.
+rpc_http_min_request_interval_ms = 200
+
+[amm_simulation]
+# Post-trade simulation remains a read-only shadow feature.  The local worker
+# must expose complete protocol-specific after-state adapters before enabling.
+enabled = false
+mode = "shadow"
+allowed_protocols = []
+max_path_legs = 4
+max_state_bytes = 1048576
+max_computation_steps = 1000000
+max_inflight_requests = 32
+max_pending_paths = 256
+max_snapshot_dependencies = 64
+max_evidence_bundle_bytes = 8388608
+max_queue_bytes = 16777216
+
+# Put only selected pool addresses here.  A pool registry/discovery job will
+# produce larger reviewed profiles later.
+[[solana.raydium_clmm_pool]]
+pool_id = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+label = "PUMP/SOL Raydium CLMM"
+
+[[solana.raydium_clmm_pool]]
+pool_id = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+label = "SOL/USDT Raydium CLMM"
+
+[[cex_stream]]
+venue = "MEXC"
+symbols = ["PUMPUSDT", "SOLUSDT"]
+
+[local_route_evaluator]
+# The evaluator is disabled until the local quote worker and both public CEX
+# books have been smoke-tested.  It has no order/wallet/transaction capability.
+enabled = false
+minimum_quote_interval_ms = 100
+maximum_book_age_ms = 1000
+# Four refresh periods: after this, the pool state is treated as unhealthy.
+maximum_pool_state_age_ms = 60000
+maximum_timing_skew_ms = 1000
+candidate_event_limit = 5000
+minimum_candidate_edge_bps = "0"
+candidate_improvement_bps = "1"
+# Optional compact report produced by `audit-cex-fees`; it contains fee rates,
+# not API credentials.  Missing symbols retain their labelled public baseline.
+# fee_audit_file = "data/fee-audits/my-fees.json"
+
+[[local_route_evaluator.route]]
+# A real three-leg inventory screen: USDT -> SOL on MEXC -> PUMP on the local
+# Raydium pool -> USDT on MEXC, and the reverse.  It does not assume a fixed
+# SOL/USDT conversion, nor does it include later inventory rebalance.
+route_id = "pump-sol-mexc-usdt"
+pool_id = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+base_mint = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+bridge_mint = "So11111111111111111111111111111111111111112"
+base_decimals = 6
+bridge_decimals = 9
+base_symbol = "PUMP"
+bridge_symbol = "SOL"
+settlement_symbol = "USDT"
+cex_venue = "MEXC"
+base_cex_symbol = "PUMPUSDT"
+bridge_cex_symbol = "SOLUSDT"
+notional_settlement = "100"
+cex_taker_fee_bps = "5"
+network_cost_floor_settlement = "0.01"
+asset_equivalence = "PUMP CEX ticker mapped to the selected canonical Solana mint; deposits, withdrawals and rebalance remain unverified"
+
+# Optional CPMM pool used for the post-trade DEX↔perp vertical slice.
+# Uncomment the whole block only together with amm_simulation.enabled=true and
+# allowed_protocols=["raydium_cpmm"]. The pool must also be listed under
+# [[solana.raydium_standard_pool]].
+# [[local_route_evaluator.sequential_amm_pool]]
+# pool_id = "replace-with-raydium-cpmm-pool-address"
+# stable_asset_id = "solana:mainnet:EPjFWdd5AufqSSqnMqUKNYixkwpRTm5cKy1HP9YBqvR6:6"
+# base_asset_id = "solana:mainnet:So11111111111111111111111111111111111111112:9"
+# stable_decimals = 6
+# perp_symbol = "SOL"

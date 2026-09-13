@@ -1,0 +1,40 @@
+{
+  "boot_id": "boot-parity",
+  "chain_consistency": "validated_multi_account_snapshot",
+  "context_slot": 1,
+  "dependency_vector": [],
+  "model_version": "raydium_amm_v4_v1",
+  "pool_refs": [
+    {
+      "asset_0_id": "synthetic:fixture:ammv4:A",
+      "asset_1_id": "synthetic:fixture:ammv4:B",
+      "chain_id": "fixture",
+      "chain_namespace": "synthetic",
+      "pool_address": "pool-ammv4",
+      "pool_spec_version": 1,
+      "program_id": "raydium_amm_v4-program",
+      "protocol": "raydium_amm_v4",
+      "protocol_revision": "v1"
+    }
+  ],
+  "pools": [
+    {
+      "fee_rate": "2500",
+      "fee_raw_a": "0",
+      "fee_raw_b": "0",
+      "need_take_pnl": false,
+      "open_orders": null,
+      "pool_id": "synthetic:fixture:pool-ammv4",
+      "protocol": "raydium_amm_v4",
+      "protocol_revision": "v1",
+      "status": 0,
+      "vault_a_raw": "1000000000",
+      "vault_b_raw": "1000000000"
+    }
+  ],
+  "schema_version": 1,
+  "sdk_versions": [],
+  "snapshot_id": "snapshot-parity-ammv4",
+  "source_epoch": 0,
+  "worker_generation": 1
+}

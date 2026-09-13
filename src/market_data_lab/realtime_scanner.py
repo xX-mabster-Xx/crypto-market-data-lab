@@ -1,0 +1,623 @@
+"""Bounded, event-driven foundation for the unified market scanner.
+
+The scanner deliberately keeps market states in memory.  It persists only a
+small status/health document and, in later route layers, compact candidate
+lifecycles.  Sources never write a raw tick log themselves.
+
+This module is venue-neutral: Solana, CEX WebSocket and future TON/EVM
+adapters publish :class:`MarketEvent` objects into the same bounded bus.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import math
+import time
+import uuid
+from collections import deque
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Protocol
+
+from market_data_lab.live_common import atomic_json
+from market_data_lab.versioned_market_state import EventEnvelope
+from market_data_lab.versioned_market_state import VersionedMarketState
+
+
+def _current_boot_id() -> str:
+    """Return the kernel boot ID, with a process-local fallback for portability."""
+
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        value = ""
+    return value or f"process-{uuid.uuid4().hex}"
+
+
+@dataclass(frozen=True, slots=True)
+class MarketEvent:
+    """One normalized in-memory state change.
+
+    ``value`` may hold a typed object such as ``BookSnapshot`` or a decoded
+    pool state.  It is intentionally not serialized.  ``summary`` is a small
+    JSON-safe diagnostic projection used by the status page and tests.
+    """
+
+    source: str
+    key: str
+    kind: str
+    value: Any
+    summary: Mapping[str, Any]
+    received_realtime_ns: int
+    received_monotonic_ns: int
+    chain_position: int | None = None
+    event_id: str | None = None
+    schema_version: int = 2
+    source_epoch: int = 0
+    instrument_or_pool_id: str | None = None
+    boot_id: str | None = None
+    exchange_event_time_ns: int | None = None
+    exchange_event_time_semantics: str | None = None
+    quality_flags: tuple[str, ...] = ()
+    provenance: str | None = None
+
+    def envelope(self, *, default_boot_id: str) -> EventEnvelope:
+        """Project the live event into the M1 versioned envelope contract."""
+
+        event_id = self.event_id or (
+            f"legacy:{self.source}:{self.source_epoch}:{self.key}:"
+            f"{self.received_monotonic_ns}"
+        )
+        return EventEnvelope(
+            event_id=event_id,
+            event_type=self.kind,
+            schema_version=self.schema_version,
+            source_id=self.source,
+            source_epoch=self.source_epoch,
+            instrument_or_pool_id=self.instrument_or_pool_id or self.key,
+            received_realtime_ns=self.received_realtime_ns,
+            received_monotonic_ns=self.received_monotonic_ns,
+            boot_id=self.boot_id or default_boot_id,
+            source_sequence=self.chain_position,
+            payload=self.value,
+            exchange_event_time_ns=self.exchange_event_time_ns,
+            exchange_event_time_semantics=self.exchange_event_time_semantics,
+            quality_flags=self.quality_flags,
+            provenance=self.provenance or self.source,
+        )
+
+
+@dataclass
+class SourceHealth:
+    """Small, bounded health record for one reconnectable source."""
+
+    source: str
+    starts: int = 0
+    restarts: int = 0
+    updates: int = 0
+    first_event_monotonic_ns: int | None = None
+    last_event_realtime_ns: int | None = None
+    last_event_monotonic_ns: int | None = None
+    last_error: str | None = None
+    running: bool = False
+    source_epoch: int = 0
+    _interarrival_ms: deque[float] = field(default_factory=lambda: deque(maxlen=1_024), repr=False)
+    _recent_errors: deque[str] = field(default_factory=lambda: deque(maxlen=8), repr=False)
+
+    def record_error(self, error: str) -> None:
+        bounded = error[:2_048]
+        self.last_error = bounded
+        self._recent_errors.append(bounded)
+
+    def observe(self, event: MarketEvent) -> None:
+        if self.last_event_monotonic_ns is not None:
+            self._interarrival_ms.append(
+                max(0.0, (event.received_monotonic_ns - self.last_event_monotonic_ns) / 1_000_000),
+            )
+        if self.first_event_monotonic_ns is None:
+            self.first_event_monotonic_ns = event.received_monotonic_ns
+        self.updates += 1
+        self.last_event_realtime_ns = event.received_realtime_ns
+        self.last_event_monotonic_ns = event.received_monotonic_ns
+        self.last_error = None
+
+    def snapshot(self, *, now_monotonic_ns: int) -> dict[str, Any]:
+        age_ms: float | None = None
+        if self.last_event_monotonic_ns is not None:
+            age_ms = max(0.0, (now_monotonic_ns - self.last_event_monotonic_ns) / 1_000_000)
+        update_rate_per_second: float | None = None
+        if (
+            self.first_event_monotonic_ns is not None
+            and self.last_event_monotonic_ns is not None
+            and self.last_event_monotonic_ns > self.first_event_monotonic_ns
+        ):
+            elapsed_seconds = (
+                self.last_event_monotonic_ns - self.first_event_monotonic_ns
+            ) / 1_000_000_000
+            update_rate_per_second = (self.updates - 1) / elapsed_seconds
+        interarrival = sorted(self._interarrival_ms)
+
+        def percentile(fraction: float) -> float | None:
+            if not interarrival:
+                return None
+            index = min(len(interarrival) - 1, round((len(interarrival) - 1) * fraction))
+            return round(interarrival[index], 3)
+
+        return {
+            "running": self.running,
+            "source_epoch": self.source_epoch,
+            "starts": self.starts,
+            "restarts": self.restarts,
+            "updates": self.updates,
+            "update_rate_per_second": (
+                round(update_rate_per_second, 3) if update_rate_per_second is not None else None
+            ),
+            "interarrival_ms": {
+                "samples": len(interarrival),
+                "p50": percentile(0.50),
+                "p95": percentile(0.95),
+                "max": round(interarrival[-1], 3) if interarrival else None,
+            },
+            "last_event_realtime_ns": self.last_event_realtime_ns,
+            "last_event_age_ms": round(age_ms, 3) if age_ms is not None else None,
+            "last_error": self.last_error,
+            "recent_errors": list(self._recent_errors),
+        }
+
+
+class ScannerSource(Protocol):
+    """An adapter supervised by :class:`RealtimeScanner`."""
+
+    name: str
+
+    async def run(
+        self,
+        publish: Callable[[MarketEvent], Awaitable[None]],
+        stop_event: asyncio.Event,
+    ) -> None: ...
+
+    def describe(self) -> Mapping[str, Any]: ...
+
+
+class RollingStateStore:
+    """Latest state plus a time-bounded in-memory audit window per key."""
+
+    def __init__(
+        self,
+        *,
+        retention_seconds: float,
+        max_events_per_key: int,
+        history_minimum_interval_ms: float = 0,
+        boot_id: str | None = None,
+    ) -> None:
+        if retention_seconds <= 0 or max_events_per_key <= 0 or history_minimum_interval_ms < 0:
+            raise ValueError("state-store retention, capacity, and interval must be valid")
+        self.retention_ns = int(retention_seconds * 1_000_000_000)
+        self.history_minimum_interval_ns = int(history_minimum_interval_ms * 1_000_000)
+        self.max_events_per_key = max_events_per_key
+        self.boot_id = boot_id or _current_boot_id()
+        self._versioned = VersionedMarketState(boot_id=self.boot_id)
+        self._history: dict[str, deque[MarketEvent]] = {}
+        self._latest: dict[str, MarketEvent] = {}
+        self._total_updates = 0
+        self._discarded_by_retention = 0
+        self._coalesced_by_interval = 0
+        self._rejected_out_of_order = 0
+        self._invalidated_by_source_epoch = 0
+
+    @property
+    def total_updates(self) -> int:
+        return self._total_updates
+
+    @property
+    def discarded_by_retention(self) -> int:
+        return self._discarded_by_retention
+
+    @property
+    def coalesced_by_interval(self) -> int:
+        return self._coalesced_by_interval
+
+    def advance_source_epoch(self, source: str, source_epoch: int) -> tuple[str, ...]:
+        invalidated = self._versioned.advance_source_epoch(source, source_epoch)
+        for key in invalidated:
+            latest = self._latest.get(key)
+            if latest is not None and latest.source == source:
+                self._latest.pop(key, None)
+        self._invalidated_by_source_epoch += len(invalidated)
+        return invalidated
+
+    def add(self, event: MarketEvent) -> bool:
+        envelope = event.envelope(default_boot_id=self.boot_id)
+        put = self._versioned.put(envelope, ttl_ns=None)
+        if not put.accepted:
+            self._rejected_out_of_order += 1
+            return False
+        for key in put.invalidated_keys:
+            if key == event.key:
+                continue
+            latest = self._latest.get(key)
+            if latest is not None and latest.source == event.source:
+                self._latest.pop(key, None)
+                self._invalidated_by_source_epoch += 1
+        history = self._history.setdefault(
+            event.key,
+            deque(maxlen=self.max_events_per_key),
+        )
+        self._latest[event.key] = event
+        self._total_updates += 1
+        cutoff = event.received_monotonic_ns - self.retention_ns
+        while history and history[0].received_monotonic_ns < cutoff:
+            history.popleft()
+            self._discarded_by_retention += 1
+        if (
+            self.history_minimum_interval_ns > 0
+            and history
+            and event.received_monotonic_ns - history[-1].received_monotonic_ns
+            < self.history_minimum_interval_ns
+        ):
+            # The event still travels through the live bus, and `_latest`
+            # advances immediately.  Only the optional retrospective window is
+            # coalesced, avoiding a RAM explosion on sub-millisecond L2 feeds.
+            self._coalesced_by_interval += 1
+            return True
+        if len(history) == history.maxlen:
+            self._discarded_by_retention += 1
+        history.append(event)
+        return True
+
+    def latest(self, key: str) -> MarketEvent | None:
+        return self._latest.get(key)
+
+    def recent(self, key: str) -> tuple[MarketEvent, ...]:
+        return tuple(self._history.get(key, ()))
+
+    def snapshot(self, *, now_monotonic_ns: int, limit: int = 256) -> dict[str, Any]:
+        states: dict[str, Any] = {}
+        # This is diagnostic output, not a full market-data export.  Stable
+        # lexical truncation keeps the status file bounded even for a huge
+        # configured universe.
+        for key in sorted(self._latest)[:limit]:
+            event = self._latest[key]
+            history = self._history.get(key, ())
+            if event is None:
+                continue
+            versioned = self._versioned.latest(event.instrument_or_pool_id or key)
+            age_ms = max(0.0, (now_monotonic_ns - event.received_monotonic_ns) / 1_000_000)
+            states[key] = {
+                "source": event.source,
+                "kind": event.kind,
+                "event_id": event.event_id,
+                "source_epoch": event.source_epoch,
+                "state_version": (
+                    versioned.state_version if versioned is not None else None
+                ),
+                "chain_position": event.chain_position,
+                "last_event_realtime_ns": event.received_realtime_ns,
+                "age_ms": round(age_ms, 3),
+                "retained_updates": len(history),
+                "summary": dict(event.summary),
+            }
+        return {
+            "schema_version": 2,
+            "boot_id": self.boot_id,
+            "keys": len(self._latest),
+            "total_updates": self._total_updates,
+            "discarded_by_retention": self._discarded_by_retention,
+            "coalesced_by_interval": self._coalesced_by_interval,
+            "rejected_out_of_order_or_duplicate": self._rejected_out_of_order,
+            "invalidated_by_source_epoch": self._invalidated_by_source_epoch,
+            "history_minimum_interval_ms": self.history_minimum_interval_ns / 1_000_000,
+            "displayed_keys": len(states),
+            "states": states,
+        }
+
+
+class CoalescingEventBus:
+    """A bounded event queue which drops stale work but preserves latest state."""
+
+    def __init__(self, store: RollingStateStore, *, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("event bus capacity must be positive")
+        self.store = store
+        self._queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=capacity)
+        self.capacity = capacity
+        self.dropped_events = 0
+        self.rejected_state_events = 0
+
+    async def publish(self, event: MarketEvent) -> None:
+        if not self.store.add(event):
+            self.rejected_state_events += 1
+            return
+        if self._queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._queue.get_nowait()
+                self.dropped_events += 1
+        with contextlib.suppress(asyncio.QueueFull):
+            self._queue.put_nowait(event)
+
+    async def next_event(self) -> MarketEvent:
+        return await self._queue.get()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "capacity": self.capacity,
+            "queued": self._queue.qsize(),
+            "dropped_events": self.dropped_events,
+            "rejected_state_events": self.rejected_state_events,
+        }
+
+
+EventHandler = Callable[[MarketEvent], Awaitable[None]]
+StatusProvider = Callable[[], Mapping[str, Any]]
+ShutdownHandler = Callable[[], Awaitable[None]]
+
+DEFAULT_SUPERVISOR_RETRY_INITIAL_SECONDS = 0.25
+DEFAULT_SUPERVISOR_RETRY_MAX_SECONDS = 15.0
+
+
+def _supervisor_retry_seconds(
+    source: ScannerSource,
+    attribute: str,
+    *,
+    default: float,
+) -> float:
+    """Return a source-specific retry setting without trusting malformed values."""
+
+    value = getattr(source, attribute, default)
+    if isinstance(value, bool):
+        return default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    return seconds if math.isfinite(seconds) and seconds > 0 else default
+
+
+@dataclass
+class RealtimeScanner:
+    """Supervise sources and publish only bounded diagnostics to disk."""
+
+    sources: Sequence[ScannerSource]
+    output_directory: Path
+    retention_seconds: float = 180.0
+    max_events_per_key: int = 4_096
+    history_minimum_interval_ms: float = 0
+    event_bus_capacity: int = 8_192
+    status_flush_seconds: float = 2.0
+    event_handler: EventHandler | None = None
+    status_providers: Mapping[str, StatusProvider] = field(default_factory=dict)
+    shutdown_handlers: Sequence[ShutdownHandler] = ()
+    _store: RollingStateStore = field(init=False, repr=False)
+    _bus: CoalescingEventBus = field(init=False, repr=False)
+    _health: dict[str, SourceHealth] = field(init=False, repr=False)
+    _stop_event: asyncio.Event = field(init=False, repr=False)
+    _started_at: str = field(init=False, repr=False)
+    _started_monotonic: float = field(init=False, repr=False)
+    _boot_id: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        names = [source.name for source in self.sources]
+        if not names or len(set(names)) != len(names):
+            raise ValueError("scanner source names must be non-empty and unique")
+        if self.status_flush_seconds <= 0:
+            raise ValueError("status_flush_seconds must be positive")
+        if any(not isinstance(name, str) or not name.strip() for name in self.status_providers):
+            raise ValueError("status provider names must be non-empty strings")
+        self._boot_id = _current_boot_id()
+        self._store = RollingStateStore(
+            retention_seconds=self.retention_seconds,
+            max_events_per_key=self.max_events_per_key,
+            history_minimum_interval_ms=self.history_minimum_interval_ms,
+            boot_id=self._boot_id,
+        )
+        self._bus = CoalescingEventBus(self._store, capacity=self.event_bus_capacity)
+        self._health = {name: SourceHealth(name) for name in names}
+        self._stop_event = asyncio.Event()
+        self._started_at = ""
+        self._started_monotonic = 0.0
+
+    @property
+    def store(self) -> RollingStateStore:
+        return self._store
+
+    @property
+    def stop_event(self) -> asyncio.Event:
+        return self._stop_event
+
+    async def _publish(self, event: MarketEvent) -> None:
+        health = self._health.get(event.source)
+        if health is None:
+            raise ValueError(f"event references unknown source {event.source!r}")
+        health.observe(event)
+        await self._bus.publish(event)
+
+    async def _source_supervisor(self, source: ScannerSource) -> None:
+        health = self._health[source.name]
+        retry_initial_seconds = _supervisor_retry_seconds(
+            source,
+            "supervisor_retry_initial_seconds",
+            default=DEFAULT_SUPERVISOR_RETRY_INITIAL_SECONDS,
+        )
+        retry_max_seconds = max(
+            retry_initial_seconds,
+            _supervisor_retry_seconds(
+                source,
+                "supervisor_retry_max_seconds",
+                default=DEFAULT_SUPERVISOR_RETRY_MAX_SECONDS,
+            ),
+        )
+        retry_delay = retry_initial_seconds
+        while not self._stop_event.is_set():
+            health.starts += 1
+            health.source_epoch += 1
+            source_epoch = health.source_epoch
+            self._store.advance_source_epoch(source.name, source_epoch)
+            event_counter = 0
+
+            async def publish_for_epoch(event: MarketEvent) -> None:
+                nonlocal event_counter
+                event_counter += 1
+                enriched = replace(
+                    event,
+                    event_id=(
+                        event.event_id
+                        or f"{self._boot_id}:{source.name}:{source_epoch}:{event_counter}"
+                    ),
+                    schema_version=max(2, event.schema_version),
+                    source_epoch=source_epoch,
+                    instrument_or_pool_id=event.instrument_or_pool_id or event.key,
+                    boot_id=self._boot_id,
+                )
+                await self._publish(enriched)
+
+            health.running = True
+            try:
+                await source.run(publish_for_epoch, self._stop_event)
+                if not self._stop_event.is_set():
+                    raise RuntimeError("source returned without scanner shutdown")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                health.running = False
+                health.restarts += 1
+                health.record_error(f"{type(exc).__name__}: {exc}")
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=retry_delay)
+                except TimeoutError:
+                    retry_delay = min(retry_delay * 2, retry_max_seconds)
+                continue
+            finally:
+                health.running = False
+            retry_delay = retry_initial_seconds
+
+    async def _event_consumer(self) -> None:
+        while not self._stop_event.is_set():
+            event = await self._bus.next_event()
+            if self.event_handler is not None:
+                try:
+                    await self.event_handler(event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # A route-specific failure must not terminate state feeds.
+                    health = self._health.setdefault("event_handler", SourceHealth("event_handler"))
+                    health.restarts += 1
+                    health.record_error(f"{type(exc).__name__}: {exc}")
+
+    def snapshot(self, *, status: str) -> dict[str, Any]:
+        now_monotonic_ns = time.monotonic_ns()
+        result: dict[str, Any] = {
+            "schema_version": 1,
+            "status": status,
+            "started_at": self._started_at,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "duration_wall_seconds": round(time.monotonic() - self._started_monotonic, 6),
+            "raw_market_data_persisted": False,
+            "versioned_event_schema": 2,
+            "boot_id": self._boot_id,
+            "retention": {
+                "in_memory_seconds": self.retention_seconds,
+                "max_events_per_key": self.max_events_per_key,
+                "history_minimum_interval_ms": self.history_minimum_interval_ms,
+                "policy": (
+                    "latest state plus a bounded in-memory rolling window; "
+                    "live bus receives every update"
+                ),
+            },
+            "event_bus": self._bus.snapshot(),
+            "sources": {
+                name: health.snapshot(now_monotonic_ns=now_monotonic_ns)
+                for name, health in sorted(self._health.items())
+            },
+            "state": self._store.snapshot(now_monotonic_ns=now_monotonic_ns),
+        }
+        extensions: dict[str, Any] = {}
+        for name, provider in sorted(self.status_providers.items()):
+            try:
+                snapshot = provider()
+                if not isinstance(snapshot, Mapping):
+                    raise TypeError("status provider must return a mapping")
+                extensions[name] = dict(snapshot)
+            except Exception as exc:
+                # Diagnostics must never take down market-data sources.  The
+                # provider itself remains responsible for not placing raw
+                # market values or credentials in its compact projection.
+                extensions[name] = {"status_provider_error": f"{type(exc).__name__}: {exc}"[:512]}
+        if extensions:
+            result["extensions"] = extensions
+        return result
+
+    async def _status_writer(self) -> None:
+        path = self.output_directory / "status.json"
+        while not self._stop_event.is_set():
+            atomic_json(path, self.snapshot(status="running"))
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self.status_flush_seconds)
+            except TimeoutError:
+                pass
+
+    def _manifest(self, *, status: str, error: str | None = None) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "status": status,
+            "started_at": self._started_at,
+            "stopped_at": datetime.now(UTC).isoformat() if status != "running" else None,
+            "mode": "unified_realtime_scanner",
+            "raw_market_data_persisted": False,
+            "sources": [dict(source.describe()) for source in self.sources],
+            "error": error,
+            "wallet_or_private_key_used": False,
+            "transactions_submitted": False,
+        }
+
+    async def run(self, *, duration_seconds: float | None = None) -> dict[str, Any]:
+        if duration_seconds is not None and duration_seconds <= 0:
+            raise ValueError("duration_seconds must be positive when supplied")
+        if self.output_directory.exists():
+            raise FileExistsError(f"refusing to overwrite scanner run {self.output_directory}")
+        self.output_directory.mkdir(parents=True)
+        self._started_at = datetime.now(UTC).isoformat()
+        self._started_monotonic = time.monotonic()
+        atomic_json(self.output_directory / "manifest.json", self._manifest(status="running"))
+
+        source_tasks = [asyncio.create_task(self._source_supervisor(source)) for source in self.sources]
+        status_task = asyncio.create_task(self._status_writer())
+        consumer_task = asyncio.create_task(self._event_consumer())
+        final_status = "completed"
+        final_error: str | None = None
+        try:
+            if duration_seconds is None:
+                await self._stop_event.wait()
+            else:
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=duration_seconds)
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            final_status = "stopped"
+        except Exception as exc:
+            final_status = "error"
+            final_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            self._stop_event.set()
+            for handler in self.shutdown_handlers:
+                try:
+                    await handler()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    health = self._health.setdefault("shutdown_handler", SourceHealth("shutdown_handler"))
+                    health.restarts += 1
+                    health.record_error(f"{type(exc).__name__}: {exc}")
+            for task in (*source_tasks, status_task, consumer_task):
+                task.cancel()
+            await asyncio.gather(*source_tasks, status_task, consumer_task, return_exceptions=True)
+            atomic_json(self.output_directory / "status.json", self.snapshot(status=final_status))
+            atomic_json(
+                self.output_directory / "manifest.json",
+                self._manifest(status=final_status, error=final_error),
+            )
+        return self._manifest(status=final_status, error=final_error)

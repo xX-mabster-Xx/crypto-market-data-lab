@@ -1,0 +1,1096 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-02T23:30:14.800661+00:00",
+  "kind": "solana_pool_registry",
+  "not_a_price_feed": true,
+  "hot_price_source": "direct Solana RPC/WebSocket only",
+  "selection_policy": {
+    "allowed_mints": [
+      "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump",
+      "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+      "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+      "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
+      "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+      "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+      "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+      "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5",
+      "So11111111111111111111111111111111111111112",
+      "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+      "hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux",
+      "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+      "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
+    ],
+    "minimum_tvl_usd": "100000",
+    "minimum_volume_24h_usd": "25000",
+    "max_pools_per_protocol": 30,
+    "require_verified_tokens": true
+  },
+  "sources": [
+    {
+      "source": "raydium_api_v3",
+      "endpoint_origin": "https://api-v3.raydium.io",
+      "pools_observed": 1000,
+      "pages_requested": 1,
+      "error": null,
+      "response_rtt_ms": 764.25
+    },
+    {
+      "source": "meteora_dlmm_data_api",
+      "endpoint_origin": "https://dlmm.datapi.meteora.ag",
+      "pools_observed": 1000,
+      "pages_requested": 1,
+      "error": null,
+      "response_rtt_ms": 1943.384
+    }
+  ],
+  "pools": [
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "5236935.358770781",
+      "volume_24h_usd": "37499614.83987953",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.04,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 4,
+        "dynamic_fee_pct": 0.00023080000000000005
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "HTvjzsfX3yU6BUodCjZ5vZkUrAxMDTrBs3CJaq43ashR",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "202716.46581972865",
+      "volume_24h_usd": "14896331.102853656",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.01,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 1,
+        "dynamic_fee_pct": 8.9e-06
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "3734470.732402879",
+      "volume_24h_usd": "7207851.723229835",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.1,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 10,
+        "dynamic_fee_pct": 0.0
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "3C5YE97HADPDxZehYq9Cis8AXr9aNyrUsczKzE1nDbW9",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+        "symbol": "TRUMP",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "19473421.554772828",
+      "volume_24h_usd": "4449009.480840254",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.1,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 10,
+        "dynamic_fee_pct": 3.53e-05
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "7ubS3GccjhQY99AYNKXjNJqnXjaokEdfdV915xnCb96r",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+        "symbol": "cbBTC",
+        "decimals": 8,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "1921253.1170265805",
+      "volume_24h_usd": "3975077.4632613217",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.04,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 4,
+        "dynamic_fee_pct": 2.9999999999999997e-06
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "HDhWhQCBrSh9xNWmNtsTi86eWj3yCoEiaRodjgNydo1b",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+        "symbol": "cbBTC",
+        "decimals": 8,
+        "verified": true
+      },
+      "token_b": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "tvl_usd": "357594.7784955669",
+      "volume_24h_usd": "2887593.173246992",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.03,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 2,
+        "dynamic_fee_pct": 0.0007999999999999999
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "BVRbyLjjfSBcoyiYFuxbgKYnWuiFaF9CSXEa5vdSZ9Hh",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "1878143.1076576896",
+      "volume_24h_usd": "1475697.393675622",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.2,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 20,
+        "dynamic_fee_pct": 5e-05
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "9d9mb8kooFfaD3SctgZtkxQypkshx6ezhbKio89ixyy2",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+        "symbol": "TRUMP",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "20734918.04889215",
+      "volume_24h_usd": "1128006.2719669868",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.1,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 50,
+        "dynamic_fee_pct": 0.000479
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "C8Gr6AUuq9hEdSYJzoEpNcdjpojPZwqG5MtQbeouNNwg",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+        "symbol": "JUP",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "tvl_usd": "1352411.4587636923",
+      "volume_24h_usd": "974983.9113908232",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.15,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 80,
+        "dynamic_fee_pct": 0.00030000000000000003
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "9SMp4yLKGtW9TnLimfVPkDARsyNSfJw43WMke4r7KoZj",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+        "symbol": "PUMP",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "2838629.585430815",
+      "volume_24h_usd": "962766.1360632592",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.2,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 20,
+        "dynamic_fee_pct": 0.0007999999999999999
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "HbjYfcWZBjCBYTJpZkLGxqArVmZVu3mQcRudb6Wg1sVh",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+        "symbol": "PUMP",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "tvl_usd": "1592725.3677313195",
+      "volume_24h_usd": "626625.0195129947",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.2,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 20,
+        "dynamic_fee_pct": 0.0008299
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "HfgjZDmexhFVD28Vkb1NbQwWeXP3uDcVTLPjSGHmRHhL",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+        "symbol": "JUP",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "262473.28334845323",
+      "volume_24h_usd": "610164.7925987019",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.1,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 50,
+        "dynamic_fee_pct": 0.0025
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "2QDGj5BWMSNyEfmyDFx7eEvWWm4KujUPJ38Xdkntvxtd",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+        "symbol": "PUMP",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "tvl_usd": "356458.9897175209",
+      "volume_24h_usd": "511906.8174577714",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.1,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 10,
+        "dynamic_fee_pct": 1.2e-05
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "CgqwPLSFfht89pF5RSKGUUMFj5zRxoUt4861w2SkXaqY",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "597123.672232894",
+      "volume_24h_usd": "487407.7106328649",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.05,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 80,
+        "dynamic_fee_pct": 0.0048
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "88LoXa6pK8RjStugRxTwz3scTHMc986y7xE1DLNbwfPy",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+        "symbol": "PUMP",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "217858.94579569748",
+      "volume_24h_usd": "155763.00831087612",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.2,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 80,
+        "dynamic_fee_pct": 0.0048
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "6wJ7W3oHj7ex6MVFp2o26NSof3aey7U8Brs8E371WCXA",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
+        "symbol": "Fartcoin",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "tvl_usd": "200336.35665682697",
+      "volume_24h_usd": "78769.51936723077",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.2,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 20,
+        "dynamic_fee_pct": 0.0007999999999999999
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "H2USRSaWuUchkbdmSJgKNfAm7ocyD4ZnCm69oRGyecKw",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij",
+        "symbol": "cbBTC",
+        "decimals": 8,
+        "verified": true
+      },
+      "token_b": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "tvl_usd": "149995.57416481565",
+      "volume_24h_usd": "60893.16812665901",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.15,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 15,
+        "dynamic_fee_pct": 0.0006749999999999999
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "token_b": {
+        "address": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        "symbol": "USDT",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "265319.3252144122",
+      "volume_24h_usd": "55720.17835838827",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.01,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 1,
+        "dynamic_fee_pct": 0.0
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "meteora_dlmm",
+      "pool_id": "3D9MyL5iD9uqbe2FYvivHsywHWr3nJR1krEcEWXUCGzr",
+      "pool_kind": "DLMM",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "SOL",
+        "decimals": 9,
+        "verified": true
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": true
+      },
+      "tvl_usd": "149457.82093639072",
+      "volume_24h_usd": "46597.677690930184",
+      "blacklisted": false,
+      "fee_hint": {
+        "base_fee_pct": 0.25,
+        "max_fee_pct": 0.0,
+        "protocol_fee_pct": 5.0,
+        "bin_step": 50,
+        "dynamic_fee_pct": 0.0025
+      },
+      "discovery_origin": "https://dlmm.datapi.meteora.ag"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "6985894.18",
+      "volume_24h_usd": "24763790.863654025",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 400,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 1
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+        "symbol": "PUMP",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "1007133.04",
+      "volume_24h_usd": "3894158.369335781",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 1000,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 10
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        "symbol": "USDT",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "959569.5",
+      "volume_24h_usd": "3572135.497618921",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 100,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 1
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "token_b": {
+        "address": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        "symbol": "USDT",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "3620811.48",
+      "volume_24h_usd": "1504229.2917693055",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 100,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 1
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "CYbD9RaToYMtWKA7QZyoLahnHdWq553Vm62Lh6qWtuxq",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "381839.4",
+      "volume_24h_usd": "1141070.8296483327",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 200,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 1
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "9n3dSLrERZQp95dHXywft7xV8D8xnGFLaUHtEhQVaXaC",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+        "symbol": "PYTH",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "382125.2",
+      "volume_24h_usd": "890681.7805086417",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 2500,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 60
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "2QdhepnKRTLjjSqPL1PtKNwqrUkoLee5Gqs8bvZhRdMv",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "429107.91",
+      "volume_24h_usd": "582499.7014675301",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 500,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 10
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "CRoTdDUM3NJGbuvB7Vr9rhmRxnSswMjnTLC1ANjhwsdq",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
+        "symbol": "TRUMP",
+        "decimals": 6,
+        "verified": null
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "986194.48",
+      "volume_24h_usd": "333210.5934806302",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 1000,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 10
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "8sLbNZoA1cfnvMJLPfp98ZLAnFSYCFApfJKMbiXNLwxj",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "502288.36",
+      "volume_24h_usd": "63834.60341840388",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 100,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 1
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof",
+        "symbol": "RENDER",
+        "decimals": 8,
+        "verified": null
+      },
+      "tvl_usd": "260632.39",
+      "volume_24h_usd": "55670.772871289",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 2500,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 60
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_clmm",
+      "pool_id": "3UwfrdLTpAjxTRni1boc5HUWe6hzc4HgE5yLdvEp2Noc",
+      "pool_kind": "Concentrated",
+      "token_a": {
+        "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+        "symbol": "Bonk",
+        "decimals": 5,
+        "verified": null
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "148765.85",
+      "volume_24h_usd": "48478.02155374339",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 1500,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000,
+        "tickSpacing": 10
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_unknown",
+      "pool_id": "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2",
+      "pool_kind": "Standard",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "14206231.46",
+      "volume_24h_usd": "12015611.424054679",
+      "blacklisted": false,
+      "fee_hint": {},
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_unknown",
+      "pool_id": "91axdGmMoqQQg2MPUXKxT3bdqX4p2RMLXqZSQgXn2JpM",
+      "pool_kind": "Standard",
+      "token_a": {
+        "address": "hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux",
+        "symbol": "HNT",
+        "decimals": 8,
+        "verified": null
+      },
+      "token_b": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "tvl_usd": "380272.52",
+      "volume_24h_usd": "982276.07768619",
+      "blacklisted": false,
+      "fee_hint": {},
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_unknown",
+      "pool_id": "Bzc9NZfMqkXR6fz1DBph7BDf9BroyEf6pnzESP7v5iiw",
+      "pool_kind": "Standard",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump",
+        "symbol": "Fartcoin",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "7498233.66",
+      "volume_24h_usd": "832350.6024655293",
+      "blacklisted": false,
+      "fee_hint": {},
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_unknown",
+      "pool_id": "7XawhbbxtsRcQA8KTkHT9f9nc6d69UwqCDh6U5EEbEmX",
+      "pool_kind": "Standard",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        "symbol": "USDT",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "716653.6",
+      "volume_24h_usd": "317559.8424940624",
+      "blacklisted": false,
+      "fee_hint": {},
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_unknown",
+      "pool_id": "FRhB8L7Y9Qq41qZXYLtC2nw8An1RJfLLxRF2x9RwLLMo",
+      "pool_kind": "Standard",
+      "token_a": {
+        "address": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+        "symbol": "POPCAT",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "tvl_usd": "3667449.06",
+      "volume_24h_usd": "186176.1628228131",
+      "blacklisted": false,
+      "fee_hint": {},
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_unknown",
+      "pool_id": "879F697iuDJGMevRkRcnW21fcXiAeLJK1ffsw2ATebce",
+      "pool_kind": "Standard",
+      "token_a": {
+        "address": "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5",
+        "symbol": "MEW",
+        "decimals": 5,
+        "verified": null
+      },
+      "token_b": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "tvl_usd": "8497452.25",
+      "volume_24h_usd": "156985.48072927594",
+      "blacklisted": false,
+      "fee_hint": {},
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_unknown",
+      "pool_id": "4AZRPNEfCJ7iw28rJu5aUyeQhYcvdcNm8cswyL51AY9i",
+      "pool_kind": "Standard",
+      "token_a": {
+        "address": "So11111111111111111111111111111111111111112",
+        "symbol": "WSOL",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump",
+        "symbol": "Pnut",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "3156743.57",
+      "volume_24h_usd": "101852.41525207278",
+      "blacklisted": false,
+      "fee_hint": {},
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_unknown",
+      "pool_id": "HBS7a3br8GMMWuqVa7VB3SMFa7xVi1tSFdoF5w4ZZ3kS",
+      "pool_kind": "Standard",
+      "token_a": {
+        "address": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+        "symbol": "POPCAT",
+        "decimals": 9,
+        "verified": null
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "684710.96",
+      "volume_24h_usd": "64322.00210090843",
+      "blacklisted": false,
+      "fee_hint": {},
+      "discovery_origin": "https://api-v3.raydium.io"
+    },
+    {
+      "protocol": "raydium_unknown",
+      "pool_id": "Eqw3bZU92t5LbTFKbaA4MTBvHcvYZDBnW7dxi14wemCF",
+      "pool_kind": "Standard",
+      "token_a": {
+        "address": "hntyVP6YFm1Hg25TN9WGLqM12b8TQmcknKrdu1oxWux",
+        "symbol": "HNT",
+        "decimals": 8,
+        "verified": null
+      },
+      "token_b": {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "symbol": "USDC",
+        "decimals": 6,
+        "verified": null
+      },
+      "tvl_usd": "115074.29",
+      "volume_24h_usd": "38431.916958720234",
+      "blacklisted": false,
+      "fee_hint": {
+        "tradeFeeRate": 10000,
+        "protocolFeeRate": 120000,
+        "fundFeeRate": 40000
+      },
+      "discovery_origin": "https://api-v3.raydium.io"
+    }
+  ],
+  "selected_pool_count": 39,
+  "raw_catalogue_rows_persisted": false,
+  "wallet_or_private_key_used": false,
+  "transactions_submitted": false,
+  "network_route": {
+    "mode": "direct",
+    "ambient_proxy_variables_ignored": [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy"
+    ]
+  }
+}

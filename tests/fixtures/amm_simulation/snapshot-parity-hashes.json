@@ -1,0 +1,29 @@
+{
+  "domain": "amm_snapshot",
+  "fixtures": {
+    "meteora_dlmm": {
+      "file": "snapshot-parity-dlmm.json",
+      "hash": "f45b95dd8afeb146faca584523e6d7116cb04ec5d5cf9a85d40692a130f3d950"
+    },
+    "orca_whirlpool": {
+      "file": "snapshot-parity-orca.json",
+      "hash": "72e843dea195a3907d76bf74fdc0fef792fbb57f7b821c9a8403e231dbc91e87"
+    },
+    "raydium_amm_v4": {
+      "file": "snapshot-parity-ammv4.json",
+      "hash": "d6c3890bddfb9849cb63dce3778918f86953353f3cc9294bf6029f139b9641e2"
+    },
+    "raydium_clmm": {
+      "file": "snapshot-parity-clmm.json",
+      "hash": "968fadbd8ba27717354a466ac9914509b7d7003bfee4dc33ccb02c3f88b3f472"
+    },
+    "raydium_cpmm": {
+      "file": "snapshot-parity-rcpmm.json",
+      "hash": "b6bba6bde9234dafb02542f2cb11ec15f94d13aff1c81d06c0152ac74acf504e"
+    },
+    "synthetic_cpmm_v1": {
+      "file": "snapshot-parity-cpmm.json",
+      "hash": "55f7dd1836b87fa5aded11717ee40cbdf9a9db9effececc97be16f36afef3634"
+    }
+  }
+}

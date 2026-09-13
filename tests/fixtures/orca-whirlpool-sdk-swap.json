@@ -1,0 +1,100 @@
+{
+  "sdk": "@orca-so/whirlpools-sdk",
+  "sdk_version": "0.22.0",
+  "tick_spacing": 64,
+  "current_tick_index": -6144,
+  "fee_rate": 500,
+  "protocol_fee_rate": 300,
+  "liquidity_raw": "100000000000000",
+  "sqrt_price_x64": "13567852949051849009",
+  "cases": [
+    {
+      "a_to_b": true,
+      "amount_specified_is_input": true,
+      "input_amount_raw": "1000000",
+      "output_amount_raw": "540711",
+      "fee_amount_raw": "500",
+      "end_tick_index": -6145,
+      "end_sqrt_price_x64": "13567852849308182462",
+      "applied_fee_rate_min": 500,
+      "applied_fee_rate_max": 500
+    },
+    {
+      "a_to_b": true,
+      "amount_specified_is_input": true,
+      "input_amount_raw": "987654321",
+      "output_amount_raw": "534032175",
+      "fee_amount_raw": "493828",
+      "end_tick_index": -6145,
+      "end_sqrt_price_x64": "13567754437503214407",
+      "applied_fee_rate_min": 500,
+      "applied_fee_rate_max": 500
+    },
+    {
+      "a_to_b": true,
+      "amount_specified_is_input": true,
+      "input_amount_raw": "1",
+      "output_amount_raw": "0",
+      "fee_amount_raw": "1",
+      "end_tick_index": -6144,
+      "end_sqrt_price_x64": "13567852949051849009",
+      "applied_fee_rate_min": 500,
+      "applied_fee_rate_max": 500
+    },
+    {
+      "a_to_b": true,
+      "amount_specified_is_input": false,
+      "output_amount_raw": "500000",
+      "input_amount_raw": "924709",
+      "fee_amount_raw": "463",
+      "end_tick_index": -6145,
+      "end_sqrt_price_x64": "13567852856818128640",
+      "applied_fee_rate_min": 500,
+      "applied_fee_rate_max": 500
+    },
+    {
+      "a_to_b": false,
+      "amount_specified_is_input": true,
+      "input_amount_raw": "1000000",
+      "output_amount_raw": "1847566",
+      "fee_amount_raw": "500",
+      "end_tick_index": -6144,
+      "end_sqrt_price_x64": "13567853133427056025",
+      "applied_fee_rate_min": 500,
+      "applied_fee_rate_max": 500
+    },
+    {
+      "a_to_b": false,
+      "amount_specified_is_input": true,
+      "input_amount_raw": "987654321",
+      "output_amount_raw": "1824732160",
+      "fee_amount_raw": "493828",
+      "end_tick_index": -6144,
+      "end_sqrt_price_x64": "13568035048021589488",
+      "applied_fee_rate_min": 500,
+      "applied_fee_rate_max": 500
+    },
+    {
+      "a_to_b": false,
+      "amount_specified_is_input": true,
+      "input_amount_raw": "1",
+      "output_amount_raw": "0",
+      "fee_amount_raw": "1",
+      "end_tick_index": -6144,
+      "end_sqrt_price_x64": "13567852949051849009",
+      "applied_fee_rate_min": 500,
+      "applied_fee_rate_max": 500
+    },
+    {
+      "a_to_b": false,
+      "amount_specified_is_input": false,
+      "output_amount_raw": "500000",
+      "input_amount_raw": "270627",
+      "fee_amount_raw": "136",
+      "end_tick_index": -6144,
+      "end_sqrt_price_x64": "13567852998948631224",
+      "applied_fee_rate_min": 500,
+      "applied_fee_rate_max": 500
+    }
+  ]
+}

@@ -1,0 +1,185 @@
+{
+  "status": "ok",
+  "started_at": "2026-08-30T14:13:03.503470+00:00",
+  "stopped_at": "2026-08-30T14:13:16.131090+00:00",
+  "duration_wall_seconds": 12.62762,
+  "requested_samples_per_venue": 10,
+  "interval_seconds": 1.0,
+  "timeout_seconds": 10.0,
+  "api_credentials_used": false,
+  "network_route": {
+    "mode": "direct",
+    "ambient_proxy_variables_ignored": [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy"
+    ]
+  },
+  "venues": {
+    "BYBIT": {
+      "endpoint": "GET /v5/market/time",
+      "server_time_resolution_ns": 1,
+      "errors": 0,
+      "last_error": null,
+      "samples": 10,
+      "recent_window_samples": 10,
+      "recent_window_capacity": 256,
+      "rtt": {
+        "count": 10,
+        "sample_count": 10,
+        "min_ms": 254.770229,
+        "mean_ms": 290.903815,
+        "p50_ms": 273.509045,
+        "p95_ms": 357.174902,
+        "p99_ms": 357.174902,
+        "max_ms": 357.174902
+      },
+      "exchange_minus_local_offset": {
+        "count": 10,
+        "sample_count": 10,
+        "min_ms": 28.913007,
+        "mean_ms": 45.159511,
+        "p50_ms": 38.053058,
+        "p95_ms": 75.982328,
+        "p99_ms": 75.982328,
+        "max_ms": 75.982328
+      },
+      "wall_monotonic_divergence": {
+        "count": 10,
+        "sample_count": 10,
+        "min_ms": -9e-05,
+        "mean_ms": -1.5e-05,
+        "p50_ms": -3.5e-05,
+        "p95_ms": 0.00015,
+        "p99_ms": 0.00015,
+        "max_ms": 0.00015
+      },
+      "minimum_rtt_sample": {
+        "ts_receive_ns": 1788099187835181612,
+        "rtt_ms": 254.770229,
+        "offset_ms": 28.913007,
+        "total_uncertainty_bound_ms": 127.385115
+      },
+      "latest_sample": {
+        "ts_receive_ns": 1788099196029942292,
+        "rtt_ms": 273.509045,
+        "offset_ms": 38.053058,
+        "total_uncertainty_bound_ms": 136.754523
+      },
+      "estimate_method": "median offset among the lowest-RTT 20% (minimum 3 samples)",
+      "offset_estimate_ns": 29530889,
+      "offset_estimate_ms": 29.530889,
+      "selected_low_rtt_samples": 3,
+      "low_rtt_cutoff_ms": 257.328022,
+      "selected_offset_mad_ms": 0.142175,
+      "selected_offset_range_ms": {
+        "min": 28.913007,
+        "max": 29.673064
+      },
+      "selected_uncertainty_intersection_ms": {
+        "valid": true,
+        "lower": -98.472108,
+        "upper": 156.298122
+      }
+    },
+    "OKX": {
+      "endpoint": "GET /api/v5/public/time",
+      "server_time_resolution_ns": 1000000,
+      "errors": 0,
+      "last_error": null,
+      "samples": 10,
+      "recent_window_samples": 10,
+      "recent_window_capacity": 256,
+      "rtt": {
+        "count": 10,
+        "sample_count": 10,
+        "min_ms": 344.785662,
+        "mean_ms": 361.774301,
+        "p50_ms": 360.209845,
+        "p95_ms": 378.14536,
+        "p99_ms": 378.14536,
+        "max_ms": 378.14536
+      },
+      "exchange_minus_local_offset": {
+        "count": 10,
+        "sample_count": 10,
+        "min_ms": 26.134545,
+        "mean_ms": 37.437197,
+        "p50_ms": 35.502607,
+        "p95_ms": 45.245209,
+        "p99_ms": 45.245209,
+        "max_ms": 45.245209
+      },
+      "wall_monotonic_divergence": {
+        "count": 10,
+        "sample_count": 10,
+        "min_ms": -5e-06,
+        "mean_ms": 0.000112,
+        "p50_ms": 0.000125,
+        "p95_ms": 0.000175,
+        "p99_ms": 0.000175,
+        "max_ms": 0.000175
+      },
+      "minimum_rtt_sample": {
+        "ts_receive_ns": 1788099187925258456,
+        "rtt_ms": 344.785662,
+        "offset_ms": 26.134545,
+        "total_uncertainty_bound_ms": 173.392831
+      },
+      "latest_sample": {
+        "ts_receive_ns": 1788099196131011530,
+        "rtt_ms": 374.513167,
+        "offset_ms": 45.245209,
+        "total_uncertainty_bound_ms": 188.256583
+      },
+      "estimate_method": "median offset among the lowest-RTT 20% (minimum 3 samples)",
+      "offset_estimate_ns": 33463054,
+      "offset_estimate_ms": 33.463054,
+      "selected_low_rtt_samples": 3,
+      "low_rtt_cutoff_ms": 355.86012,
+      "selected_offset_mad_ms": 6.119247,
+      "selected_offset_range_ms": {
+        "min": 26.134545,
+        "max": 39.582301
+      },
+      "selected_uncertainty_intersection_ms": {
+        "valid": true,
+        "lower": -139.347759,
+        "upper": 199.527376
+      }
+    }
+  },
+  "local_clock_continuity": {
+    "method": "CLOCK_REALTIME elapsed minus CLOCK_MONOTONIC elapsed",
+    "readings": 41,
+    "observed_span_seconds": 12.627571,
+    "step_threshold_ms": 5.0,
+    "suspected_discontinuities": 0,
+    "maximum_absolute_elapsed_divergence_ms": 0.00035,
+    "elapsed_divergence": {
+      "count": 40,
+      "sample_count": 40,
+      "min_ms": -0.000235,
+      "mean_ms": -5e-06,
+      "p50_ms": 0.0,
+      "p95_ms": 0.00019,
+      "p99_ms": 0.00035,
+      "max_ms": 0.00035
+    },
+    "clock_read_capture_span": {
+      "count": 41,
+      "sample_count": 41,
+      "min_ms": 0.00037,
+      "mean_ms": 0.000796,
+      "p50_ms": 0.00089,
+      "p95_ms": 0.00103,
+      "p99_ms": 0.00126,
+      "max_ms": 0.00126
+    },
+    "events": []
+  },
+  "warning": "HTTP midpoint offsets are diagnostics with route-asymmetry uncertainty; they are not NTP corrections and are not applied to market-data timestamps"
+}

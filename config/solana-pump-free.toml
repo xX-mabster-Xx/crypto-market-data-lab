@@ -1,0 +1,66 @@
+# First free-RPC profile for the unified scanner.  It is a state-feed
+# integration test, not a claim that PUMP is a profitable or complete universe.
+# It writes only bounded status diagnostics; all pool/book updates stay in RAM.
+
+[scanner]
+retention_seconds = 180
+max_events_per_key = 4096
+event_bus_capacity = 8192
+status_flush_seconds = 2
+
+[solana]
+rpc_http_url = "https://api.mainnet-beta.solana.com"
+rpc_ws_url = "wss://api.mainnet-beta.solana.com"
+timeout_seconds = 10
+
+[jupiter]
+# Keyless fallback.  A local Helius/Jupiter profile may configure api_key or
+# api_key_env; Jupiter is a gated verification source, not this feed's hot path.
+minimum_request_interval_seconds = 2.05
+
+[raydium_local_quote_worker]
+enabled = false
+tick_cache_max_age_ms = 300000
+state_snapshot_refresh_interval_ms = 15000
+rpc_http_min_request_interval_ms = 200
+
+[[solana.raydium_clmm_pool]]
+pool_id = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+label = "PUMP/SOL Raydium CLMM"
+
+[[solana.raydium_clmm_pool]]
+pool_id = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+label = "SOL/USDT Raydium CLMM"
+
+[[cex_stream]]
+venue = "MEXC"
+symbols = ["PUMPUSDT", "SOLUSDT"]
+
+[local_route_evaluator]
+enabled = false
+minimum_quote_interval_ms = 100
+maximum_book_age_ms = 1000
+maximum_pool_state_age_ms = 60000
+maximum_timing_skew_ms = 1000
+candidate_event_limit = 5000
+minimum_candidate_edge_bps = "0"
+candidate_improvement_bps = "1"
+
+[[local_route_evaluator.route]]
+route_id = "pump-sol-mexc-usdt"
+pool_id = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+base_mint = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+bridge_mint = "So11111111111111111111111111111111111111112"
+base_decimals = 6
+bridge_decimals = 9
+base_symbol = "PUMP"
+bridge_symbol = "SOL"
+settlement_symbol = "USDT"
+cex_venue = "MEXC"
+base_cex_symbol = "PUMPUSDT"
+bridge_cex_symbol = "SOLUSDT"
+notional_settlement = "100"
+# Public MEXC baseline, not an account-specific rate.
+cex_taker_fee_bps = "5"
+network_cost_floor_settlement = "0.01"
+asset_equivalence = "PUMP CEX ticker mapped to the selected canonical Solana mint; deposits, withdrawals and rebalance remain unverified"

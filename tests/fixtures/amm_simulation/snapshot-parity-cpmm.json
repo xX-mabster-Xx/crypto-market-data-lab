@@ -1,0 +1,35 @@
+{
+  "boot_id": "boot-parity",
+  "chain_consistency": "validated_multi_account_snapshot",
+  "context_slot": 1,
+  "dependency_vector": [],
+  "model_version": "synthetic_cpmm_v1",
+  "pool_refs": [
+    {
+      "asset_0_id": "synthetic:fixture:cpmm:A",
+      "asset_1_id": "synthetic:fixture:cpmm:B",
+      "chain_id": "fixture",
+      "chain_namespace": "synthetic",
+      "pool_address": "pool-cpmm",
+      "pool_spec_version": 1,
+      "program_id": "synthetic_cpmm_v1-program",
+      "protocol": "synthetic_cpmm_v1",
+      "protocol_revision": "v1"
+    }
+  ],
+  "pools": [
+    {
+      "fee_denominator": "100",
+      "fee_numerator": "1",
+      "pool_id": "synthetic:fixture:pool-cpmm",
+      "protocol": "synthetic_cpmm_v1",
+      "reserve_0_raw": "1000",
+      "reserve_1_raw": "900"
+    }
+  ],
+  "schema_version": 1,
+  "sdk_versions": [],
+  "snapshot_id": "snapshot-parity-cpmm",
+  "source_epoch": 0,
+  "worker_generation": 1
+}

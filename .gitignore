@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+config/*.local.toml
+**/node_modules/
+**/dist/
+
+# Market data is reproducible and can be large.
+data/raw/
+data/catalog/
+data/live/
+
+# Local runtime artifacts and caches.
+*.log
+.mypy_cache/
+.ruff_cache/

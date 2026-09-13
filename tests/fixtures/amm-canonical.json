@@ -1,0 +1,16 @@
+{
+  "domain": "post_trade_amm_parity",
+  "value": {
+    "z": "text",
+    "amount": "123456789012345678901",
+    "flags": [
+      true,
+      false,
+      null
+    ],
+    "nested": {
+      "b": 2,
+      "a": 1
+    }
+  }
+}

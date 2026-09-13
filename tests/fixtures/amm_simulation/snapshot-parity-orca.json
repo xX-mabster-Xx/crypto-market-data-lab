@@ -1,0 +1,59 @@
+{
+  "boot_id": "boot-parity",
+  "chain_consistency": "validated_multi_account_snapshot",
+  "context_slot": 1,
+  "dependency_vector": [],
+  "model_version": "orca_whirlpool_v1",
+  "pool_refs": [
+    {
+      "asset_0_id": "synthetic:fixture:orca:A",
+      "asset_1_id": "synthetic:fixture:orca:B",
+      "chain_id": "fixture",
+      "chain_namespace": "synthetic",
+      "pool_address": "pool-orca",
+      "pool_spec_version": 1,
+      "program_id": "orca_whirlpool-program",
+      "protocol": "orca_whirlpool",
+      "protocol_revision": "v1"
+    }
+  ],
+  "pools": [
+    {
+      "fee_growth_global_a": "0",
+      "fee_growth_global_b": "0",
+      "fee_rate": "2500",
+      "liquidity_raw": "1000000000000",
+      "pool_id": "synthetic:fixture:pool-orca",
+      "protocol": "orca_whirlpool",
+      "protocol_fee_owed_a": "0",
+      "protocol_fee_owed_b": "0",
+      "protocol_fee_rate": "120",
+      "protocol_revision": "v1",
+      "sqrt_price_x64": "18362684800000000000",
+      "tick_arrays": [
+        {
+          "start_tick_index": 0,
+          "ticks": [
+            {
+              "initialized": true,
+              "liquidity_gross_raw": "1000000",
+              "liquidity_net_raw": "0"
+            }
+          ]
+        }
+      ],
+      "tick_current_index": 100,
+      "tick_spacing": 10
+    }
+  ],
+  "schema_version": 1,
+  "sdk_versions": [
+    [
+      "@orca-so/whirlpools-sdk",
+      "0.22.0"
+    ]
+  ],
+  "snapshot_id": "snapshot-parity-orca",
+  "source_epoch": 0,
+  "worker_generation": 1
+}

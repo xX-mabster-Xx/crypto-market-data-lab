@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crypto-market-data-lab"
+version = "0.1.0"
+description = "Research-grade crypto market-data collection and replay experiments"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "nautilus_trader==2.0.0rc3",
+  "pandas>=2.3,<4",
+  "python-socks[asyncio]==3.0.0",
+  "websockets==17.1",
+]
+
+[project.scripts]
+import-bybit-archive = "market_data_lab.bybit_archive:main"
+probe-exchange-clocks = "market_data_lab.clock_probe:main"
+record-bybit-live = "market_data_lab.live_bybit:main"
+record-okx-live = "market_data_lab.live_okx:main"
+record-dual-live = "market_data_lab.dual_recorder:main"
+analyze-cross-venue = "market_data_lab.cross_venue:main"
+record-dex-quotes = "market_data_lab.dex_quotes:main"
+scan-cex-dex-cycles = "market_data_lab.cex_dex_cycles:main"
+record-raydium-clmm-prefilter = "market_data_lab.raydium_clmm_prefilter:main"
+monitor-rolling-cycles = "market_data_lab.rolling_cycle_monitor:main"
+monitor-continuous-cycles = "market_data_lab.continuous_cycle_monitor:main"
+monitor-triangle-cycles = "market_data_lab.triangle_cycle_monitor:main"
+monitor-perp-dex-basis = "market_data_lab.perp_dex_monitor:main"
+audit-cex-fees = "market_data_lab.account_fee_audit:main"
+run-unified-solana-scanner = "market_data_lab.solana_realtime_scanner:main"
+refresh-solana-pool-registry = "market_data_lab.solana_pool_registry:main"
+probe-local-raydium-quote = "market_data_lab.solana_quote_worker:main"
+replay-amm-simulation = "market_data_lab.amm_simulation.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/market_data_lab"]

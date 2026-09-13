@@ -1,0 +1,50 @@
+{
+  "boot_id": "boot-parity",
+  "chain_consistency": "validated_multi_account_snapshot",
+  "context_slot": 1,
+  "dependency_vector": [],
+  "model_version": "raydium_clmm_v1",
+  "pool_refs": [
+    {
+      "asset_0_id": "synthetic:fixture:clmm:A",
+      "asset_1_id": "synthetic:fixture:clmm:B",
+      "chain_id": "fixture",
+      "chain_namespace": "synthetic",
+      "pool_address": "pool-clmm",
+      "pool_spec_version": 1,
+      "program_id": "raydium_clmm-program",
+      "protocol": "raydium_clmm",
+      "protocol_revision": "v1"
+    }
+  ],
+  "pools": [
+    {
+      "fee_rate": "2500",
+      "liquidity_raw": "1000000000000",
+      "pool_id": "synthetic:fixture:pool-clmm",
+      "protocol": "raydium_clmm",
+      "protocol_fee_rate": "120",
+      "protocol_revision": "v1",
+      "sqrt_price_x64": "18362684800000000000",
+      "tick_arrays": [
+        {
+          "start_tick_index": 0,
+          "ticks": [
+            {
+              "initialized": true,
+              "liquidity_gross": 1000000,
+              "liquidity_net": 0
+            }
+          ]
+        }
+      ],
+      "tick_current_index": 100,
+      "tick_spacing": 10
+    }
+  ],
+  "schema_version": 1,
+  "sdk_versions": [],
+  "snapshot_id": "snapshot-parity-clmm",
+  "source_epoch": 0,
+  "worker_generation": 1
+}

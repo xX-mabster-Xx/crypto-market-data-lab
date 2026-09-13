@@ -1,0 +1,50 @@
+{
+  "boot_id": "boot-parity",
+  "chain_consistency": "validated_multi_account_snapshot",
+  "context_slot": 1,
+  "dependency_vector": [],
+  "model_version": "raydium_cpmm_v1",
+  "pool_refs": [
+    {
+      "asset_0_id": "synthetic:fixture:rcpmm:A",
+      "asset_1_id": "synthetic:fixture:rcpmm:B",
+      "chain_id": "fixture",
+      "chain_namespace": "synthetic",
+      "pool_address": "pool-rcpmm",
+      "pool_spec_version": 1,
+      "program_id": "raydium_cpmm-program",
+      "protocol": "raydium_cpmm",
+      "protocol_revision": "v1"
+    }
+  ],
+  "pools": [
+    {
+      "creator_fee_rate": "120",
+      "creator_fees_a_raw": "10",
+      "creator_fees_b_raw": "20",
+      "fee_on": "0",
+      "fund_fee_rate": "40",
+      "fund_fees_a_raw": "50",
+      "fund_fees_b_raw": "60",
+      "pool_id": "synthetic:fixture:pool-rcpmm",
+      "protocol": "raydium_cpmm",
+      "protocol_fee_rate": "120",
+      "protocol_fees_a_raw": "100",
+      "protocol_fees_b_raw": "200",
+      "protocol_revision": "v1",
+      "trade_fee_rate": "2500",
+      "vault_a_raw": "1000000",
+      "vault_b_raw": "2000000"
+    }
+  ],
+  "schema_version": 1,
+  "sdk_versions": [
+    [
+      "@raydium-io/raydium-sdk-v2",
+      "0.2.63-alpha"
+    ]
+  ],
+  "snapshot_id": "snapshot-parity-rcpmm",
+  "source_epoch": 0,
+  "worker_generation": 1
+}

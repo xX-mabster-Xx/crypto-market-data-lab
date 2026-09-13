@@ -1,0 +1,58 @@
+{
+  "boot_id": "boot-parity",
+  "chain_consistency": "validated_multi_account_snapshot",
+  "context_slot": 1,
+  "dependency_vector": [],
+  "model_version": "meteora_dlmm_v1",
+  "pool_refs": [
+    {
+      "asset_0_id": "synthetic:fixture:dlmm:A",
+      "asset_1_id": "synthetic:fixture:dlmm:B",
+      "chain_id": "fixture",
+      "chain_namespace": "synthetic",
+      "pool_address": "pool-dlmm",
+      "pool_spec_version": 1,
+      "program_id": "meteora_dlmm-program",
+      "protocol": "meteora_dlmm",
+      "protocol_revision": "v1"
+    }
+  ],
+  "pools": [
+    {
+      "active_id": 1,
+      "bin_arrays": [
+        {
+          "bins": [
+            {
+              "bin_id": 0,
+              "fee_x_raw": "0",
+              "fee_y_raw": "0",
+              "liquidity_raw": "1000000",
+              "reserve_x_raw": "1000000",
+              "reserve_y_raw": "1000000"
+            }
+          ],
+          "start_bin_id": 0
+        }
+      ],
+      "bin_step": 100,
+      "fee_bps": "20",
+      "pool_id": "synthetic:fixture:pool-dlmm",
+      "protocol": "meteora_dlmm",
+      "protocol_fee_bps": "5",
+      "protocol_revision": "v1",
+      "reserve_x_raw": "10000000000",
+      "reserve_y_raw": "10000000000"
+    }
+  ],
+  "schema_version": 1,
+  "sdk_versions": [
+    [
+      "@meteora-ag/dlmm",
+      "1.9.14"
+    ]
+  ],
+  "snapshot_id": "snapshot-parity-dlmm",
+  "source_epoch": 0,
+  "worker_generation": 1
+}
