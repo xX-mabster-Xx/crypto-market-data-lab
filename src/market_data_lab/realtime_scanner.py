@@ -11,7 +11,7 @@ adapters publish :class:`MarketEvent` objects into the same bounded bus.
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import inspect
 import math
 import time
 import uuid
@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from market_data_lab.live_common import atomic_json
 from market_data_lab.versioned_market_state import EventEnvelope
@@ -90,6 +90,22 @@ class MarketEvent:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SourceEpochChange:
+    """Control-plane boundary published before any event in a new epoch."""
+
+    source: str
+    source_epoch: int
+    reason: Literal["initial_start", "restart", "transport_reconnect"]
+    realtime_ns: int
+    monotonic_ns: int
+    previous_source_epoch: int | None = None
+
+
+class TransportReconnectRequired(RuntimeError):
+    """A transport session ended and must be replaced by the source supervisor."""
+
+
 @dataclass
 class SourceHealth:
     """Small, bounded health record for one reconnectable source."""
@@ -99,6 +115,7 @@ class SourceHealth:
     restarts: int = 0
     updates: int = 0
     received_events: int = 0
+    accepted_events: int = 0
     rejected_events: int = 0
     first_event_monotonic_ns: int | None = None
     last_event_realtime_ns: int | None = None
@@ -124,6 +141,7 @@ class SourceHealth:
             )
         if self.first_event_monotonic_ns is None:
             self.first_event_monotonic_ns = event.received_monotonic_ns
+        self.accepted_events += 1
         self.updates += 1
         self.last_event_realtime_ns = event.received_realtime_ns
         self.last_event_monotonic_ns = event.received_monotonic_ns
@@ -158,6 +176,7 @@ class SourceHealth:
             "restarts": self.restarts,
             "updates": self.updates,
             "received_events": self.received_events,
+            "accepted_events": self.accepted_events,
             "rejected_events": self.rejected_events,
             "update_rate_per_second": (
                 round(update_rate_per_second, 3) if update_rate_per_second is not None else None
@@ -182,7 +201,7 @@ class ScannerSource(Protocol):
 
     async def run(
         self,
-        publish: Callable[[MarketEvent], Awaitable[None]],
+        publish: Callable[[MarketEvent], Awaitable[Any]],
         stop_event: asyncio.Event,
     ) -> None: ...
 
@@ -212,6 +231,10 @@ class RollingStateStore:
         self._versioned = VersionedMarketState(boot_id=self.boot_id)
         self._history: dict[str, deque[MarketEvent]] = {}
         self._latest: dict[str, MarketEvent] = {}
+        # Event keys and versioned state keys are normally identical, but the
+        # contract permits them to differ.  Keep an explicit bounded index so
+        # history-only entries can also be retired after an epoch boundary.
+        self._state_key_by_event_key: dict[str, str] = {}
         self.max_state_keys = max_state_keys
         self._total_updates = 0
         self._discarded_by_retention = 0
@@ -219,8 +242,8 @@ class RollingStateStore:
         self._rejected_out_of_order = 0
         self._invalidated_by_source_epoch = 0
         self._capacity_evictions = 0
-        self._last_sweep_monotonic_ns = 0
-        self._sweep_interval_ns = int(retention_seconds * 1_000_000_000 // 10)
+        self._last_sweep_monotonic_ns: int | None = None
+        self._sweep_interval_ns = max(1, int(retention_seconds * 1_000_000_000 // 10))
 
     @property
     def total_updates(self) -> int:
@@ -236,12 +259,61 @@ class RollingStateStore:
 
     def advance_source_epoch(self, source: str, source_epoch: int) -> tuple[str, ...]:
         invalidated = self._versioned.advance_source_epoch(source, source_epoch)
-        for key in invalidated:
-            latest = self._latest.get(key)
-            if latest is not None and latest.source == source:
-                self._latest.pop(key, None)
+        for state_key in invalidated:
+            self._retire_state_key(state_key)
         self._invalidated_by_source_epoch += len(invalidated)
         return invalidated
+
+    def _retire_state_key(self, state_key: str, *, keep_event_key: str | None = None) -> tuple[str, ...]:
+        """Remove a versioned state and every local key that indexes it."""
+
+        removed: list[str] = []
+        for event_key, indexed_key in tuple(self._state_key_by_event_key.items()):
+            if indexed_key != state_key or event_key == keep_event_key:
+                continue
+            self._state_key_by_event_key.pop(event_key, None)
+            self._latest.pop(event_key, None)
+            self._history.pop(event_key, None)
+            removed.append(event_key)
+        # Defensive fallback for stores created before the explicit index was
+        # introduced or for diagnostic data populated by a custom adapter.
+        for event_key, latest in tuple(self._latest.items()):
+            indexed_key = latest.instrument_or_pool_id or event_key
+            if indexed_key == state_key and event_key != keep_event_key:
+                self._state_key_by_event_key.pop(event_key, None)
+                self._latest.pop(event_key, None)
+                self._history.pop(event_key, None)
+                removed.append(event_key)
+        if keep_event_key is None:
+            self._history.pop(state_key, None)
+        if state_key not in self._state_key_by_event_key.values():
+            self._versioned.retire(state_key)
+        return tuple(removed)
+
+    def _retire_event_key(self, event_key: str) -> None:
+        """Retire one local key without deleting a shared state record."""
+
+        state_key = self._state_key_by_event_key.pop(event_key, None)
+        latest = self._latest.pop(event_key, None)
+        self._history.pop(event_key, None)
+        if state_key is None and latest is not None:
+            state_key = latest.instrument_or_pool_id or event_key
+        if state_key is not None and state_key not in self._state_key_by_event_key.values():
+            self._versioned.retire(state_key)
+
+    def _evict_oldest_for_capacity(self) -> None:
+        if len(self._latest) < self.max_state_keys:
+            return
+        oldest_key = min(
+            self._latest,
+            key=lambda key: (
+                self._latest[key].received_monotonic_ns,
+                self._latest[key].received_realtime_ns,
+                key,
+            ),
+        )
+        self._retire_event_key(oldest_key)
+        self._capacity_evictions += 1
 
     def add(self, event: MarketEvent) -> bool:
         envelope = event.envelope(default_boot_id=self.boot_id)
@@ -249,13 +321,25 @@ class RollingStateStore:
         if not put.accepted:
             self._rejected_out_of_order += 1
             return False
-        for key in put.invalidated_keys:
-            if key == event.key:
+        previous_state_key = self._state_key_by_event_key.get(event.key)
+        if previous_state_key is not None and previous_state_key != envelope.state_key:
+            self._retire_state_key(previous_state_key)
+        # Install the mapping before eviction.  A new event key may share an
+        # existing state key; eviction must not retire the record just
+        # accepted by ``VersionedMarketState.put``.
+        self._state_key_by_event_key[event.key] = envelope.state_key
+        self._retire_state_key(envelope.state_key, keep_event_key=event.key)
+        if event.key not in self._latest:
+            self._evict_oldest_for_capacity()
+        for state_key in put.invalidated_keys:
+            # ``put`` has already installed the new record for the current
+            # event when the state key is reused.  Clear only its old history;
+            # retire unrelated invalidated records physically.
+            if state_key == envelope.instrument_or_pool_id:
+                self._retire_state_key(state_key, keep_event_key=event.key)
                 continue
-            latest = self._latest.get(key)
-            if latest is not None and latest.source == event.source:
-                self._latest.pop(key, None)
-                self._invalidated_by_source_epoch += 1
+            self._retire_state_key(state_key)
+        self._invalidated_by_source_epoch += len(put.invalidated_keys)
         history = self._history.setdefault(
             event.key,
             deque(maxlen=self.max_events_per_key),
@@ -297,21 +381,18 @@ class RollingStateStore:
 
         if now_monotonic_ns is None:
             now_monotonic_ns = time.monotonic_ns()
-        if now_monotonic_ns - self._last_sweep_monotonic_ns < self._sweep_interval_ns:
-            return ()
         self._last_sweep_monotonic_ns = now_monotonic_ns
         retired: list[str] = []
         cutoff_ns = now_monotonic_ns - self.retention_ns
-        for key in tuple(self._latest):
+        for key in sorted(set(self._latest) | set(self._history)):
             latest = self._latest.get(key)
             if latest is None:
+                self._retire_event_key(key)
+                retired.append(key)
                 continue
             if latest.received_monotonic_ns < cutoff_ns:
-                if self._versioned.retire(latest.instrument_or_pool_id or key):
-                    retired.append(key)
-                self._latest.pop(key, None)
-                self._history.pop(key, None)
-                self._invalidated_by_source_epoch += 1
+                self._retire_event_key(key)
+                retired.append(key)
         # Enforce hard key capacity by evicting oldest idle keys.
         if len(self._latest) > self.max_state_keys:
             sorted_keys = sorted(
@@ -319,14 +400,22 @@ class RollingStateStore:
                 key=lambda k: self._latest[k].received_monotonic_ns,
             )
             for key in sorted_keys[: len(self._latest) - self.max_state_keys]:
-                latest = self._latest.get(key)
-                if latest is not None:
-                    self._versioned.retire(latest.instrument_or_pool_id or key)
-                self._latest.pop(key, None)
-                self._history.pop(key, None)
+                self._retire_event_key(key)
                 self._capacity_evictions += 1
                 retired.append(key)
         return tuple(retired)
+
+    def maybe_sweep(self, *, now_monotonic_ns: int | None = None) -> tuple[str, ...]:
+        """Run the amortized sweep used by hot scanner loops."""
+
+        if now_monotonic_ns is None:
+            now_monotonic_ns = time.monotonic_ns()
+        if (
+            self._last_sweep_monotonic_ns is not None
+            and now_monotonic_ns - self._last_sweep_monotonic_ns < self._sweep_interval_ns
+        ):
+            return ()
+        return self.sweep(now_monotonic_ns=now_monotonic_ns)
 
     def snapshot(self, *, now_monotonic_ns: int, limit: int = 256) -> dict[str, Any]:
         states: dict[str, Any] = {}
@@ -434,6 +523,7 @@ class CoalescingEventBus:
                 await self._condition.wait()
             key = self._pending_order.popleft()
             event = self._pending_latest.pop(key)
+            self.pending_keys = len(self._pending_latest)
             self._condition.notify_all()
             return event
 
@@ -455,6 +545,7 @@ class CoalescingEventBus:
 EventHandler = Callable[[MarketEvent], Awaitable[None]]
 StatusProvider = Callable[[], Mapping[str, Any]]
 ShutdownHandler = Callable[[], Awaitable[None]]
+EpochChangeHandler = Callable[[SourceEpochChange], Awaitable[None] | None]
 
 DEFAULT_SUPERVISOR_RETRY_INITIAL_SECONDS = 0.25
 DEFAULT_SUPERVISOR_RETRY_MAX_SECONDS = 15.0
@@ -493,8 +584,11 @@ class RealtimeScanner:
     event_handler: EventHandler | None = None
     status_providers: Mapping[str, StatusProvider] = field(default_factory=dict)
     shutdown_handlers: Sequence[ShutdownHandler] = ()
-    epoch_change_handlers: Sequence[Callable[[str, int, int], None]] = ()
-    supervisor_stable_run_reset_after_seconds: float = 30.0
+    epoch_change_handlers: Sequence[EpochChangeHandler] = ()
+    runtime_components: Mapping[str, Any] = field(default_factory=dict)
+    supervisor_retry_reset_after_seconds: float = 30.0
+    # Backwards-compatible alias for callers that used the pre-v2 name.
+    supervisor_stable_run_reset_after_seconds: float | None = None
     _store: RollingStateStore = field(init=False, repr=False)
     _bus: CoalescingEventBus = field(init=False, repr=False)
     _health: dict[str, SourceHealth] = field(init=False, repr=False)
@@ -509,8 +603,15 @@ class RealtimeScanner:
             raise ValueError("scanner source names must be non-empty and unique")
         if self.status_flush_seconds <= 0:
             raise ValueError("status_flush_seconds must be positive")
-        if not math.isfinite(self.supervisor_stable_run_reset_after_seconds) or self.supervisor_stable_run_reset_after_seconds <= 0:
-            raise ValueError("supervisor_stable_run_reset_after_seconds must be finite and positive")
+        if self.supervisor_stable_run_reset_after_seconds is not None:
+            self.supervisor_retry_reset_after_seconds = self.supervisor_stable_run_reset_after_seconds
+        try:
+            retry_reset_seconds = float(self.supervisor_retry_reset_after_seconds)
+        except (TypeError, ValueError):
+            retry_reset_seconds = math.nan
+        if not math.isfinite(retry_reset_seconds) or retry_reset_seconds <= 0:
+            raise ValueError("supervisor_retry_reset_after_seconds must be finite and positive")
+        self.supervisor_retry_reset_after_seconds = retry_reset_seconds
         if any(not isinstance(name, str) or not name.strip() for name in self.status_providers):
             raise ValueError("status provider names must be non-empty strings")
         self._boot_id = _current_boot_id()
@@ -563,19 +664,31 @@ class RealtimeScanner:
             ),
         )
         retry_delay = retry_initial_seconds
-        run_started_monotonic = time.monotonic()
+        next_epoch_reason: Literal["initial_start", "restart", "transport_reconnect"] = (
+            "initial_start"
+        )
         while not self._stop_event.is_set():
             health.starts += 1
             old_epoch = health.source_epoch
             health.source_epoch += 1
             source_epoch = health.source_epoch
             self._store.advance_source_epoch(source.name, source_epoch)
+            change = SourceEpochChange(
+                source=source.name,
+                source_epoch=source_epoch,
+                reason=next_epoch_reason,
+                realtime_ns=time.time_ns(),
+                monotonic_ns=time.monotonic_ns(),
+                previous_source_epoch=old_epoch,
+            )
             for handler in self.epoch_change_handlers:
-                handler(source.name, old_epoch, source_epoch)
-            epoch_started_monotonic = time.monotonic()
+                result = handler(change)
+                if inspect.isawaitable(result):
+                    await result
+            run_started_monotonic = time.monotonic()
             event_counter = 0
 
-            async def publish_for_epoch(event: MarketEvent) -> None:
+            async def publish_for_epoch(event: MarketEvent) -> PublishResult:
                 nonlocal event_counter
                 event_counter += 1
                 enriched = replace(
@@ -589,7 +702,7 @@ class RealtimeScanner:
                     instrument_or_pool_id=event.instrument_or_pool_id or event.key,
                     boot_id=self._boot_id,
                 )
-                await self._publish(enriched)
+                return await self._publish(enriched)
 
             health.running = True
             try:
@@ -602,10 +715,15 @@ class RealtimeScanner:
                 health.running = False
                 health.restarts += 1
                 health.record_error(f"{type(exc).__name__}: {exc}")
+                next_epoch_reason = (
+                    "transport_reconnect"
+                    if isinstance(exc, TransportReconnectRequired)
+                    else "restart"
+                )
                 # Reset backoff if the source ran stably for a while before
                 # this failure; a single event followed by a crash should
                 # still escalate.
-                if time.monotonic() - epoch_started_monotonic >= self.supervisor_stable_run_reset_after_seconds:
+                if time.monotonic() - run_started_monotonic >= self.supervisor_retry_reset_after_seconds:
                     retry_delay = retry_initial_seconds
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=retry_delay)
@@ -619,7 +737,7 @@ class RealtimeScanner:
 
     async def _event_consumer(self) -> None:
         while not self._stop_event.is_set():
-            self._store.sweep(now_monotonic_ns=time.monotonic_ns())
+            self._store.maybe_sweep(now_monotonic_ns=time.monotonic_ns())
             event = await self._bus.next_event()
             if self.event_handler is not None:
                 try:
@@ -675,13 +793,15 @@ class RealtimeScanner:
                 extensions[name] = {"status_provider_error": f"{type(exc).__name__}: {exc}"[:512]}
         if extensions:
             result["extensions"] = extensions
+        if self.runtime_components:
+            result["runtime_components"] = dict(self.runtime_components)
         return result
 
     async def _status_writer(self) -> None:
         path = self.output_directory / "status.json"
         while not self._stop_event.is_set():
             now_monotonic_ns = time.monotonic_ns()
-            self._store.sweep(now_monotonic_ns=now_monotonic_ns)
+            self._store.maybe_sweep(now_monotonic_ns=now_monotonic_ns)
             atomic_json(path, self.snapshot(status="running"))
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self.status_flush_seconds)
@@ -689,7 +809,7 @@ class RealtimeScanner:
                 pass
 
     def _manifest(self, *, status: str, error: str | None = None) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": 1,
             "status": status,
             "started_at": self._started_at,
@@ -701,6 +821,9 @@ class RealtimeScanner:
             "wallet_or_private_key_used": False,
             "transactions_submitted": False,
         }
+        if self.runtime_components:
+            result["runtime_components"] = dict(self.runtime_components)
+        return result
 
     async def run(self, *, duration_seconds: float | None = None) -> dict[str, Any]:
         if duration_seconds is not None and duration_seconds <= 0:

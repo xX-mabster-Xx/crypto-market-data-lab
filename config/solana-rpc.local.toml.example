@@ -8,6 +8,7 @@
 [scanner]
 retention_seconds = 180
 max_events_per_key = 4096
+max_state_keys = 65536
 event_bus_capacity = 8192
 status_flush_seconds = 2
 
@@ -36,9 +37,16 @@ minimum_request_interval_seconds = 2.05
 # a managed child of `run-unified-solana-scanner`, not a separate tmux process.
 enabled = false
 tick_cache_max_age_ms = 300000
-# WebSocket remains the hot path. This low-rate batch snapshot confirms quiet
-# pools and repairs a missed account notification without quote-API polling.
+# Compatibility value retained for older supervisors; core_refresh_after_ms is
+# the explicit stale threshold used by the current worker.
 state_snapshot_refresh_interval_ms = 15000
+core_refresh_after_ms = 15000
+# A cheap scan runs frequently, but only stale, deterministically staggered
+# pools enter Agent E's low-priority bounded RPC scheduler.
+maintenance_scan_interval_ms = 1000
+refresh_stagger_window_ms = 5000
+# Dependency storms collapse to one latest trailing state notice per pool.
+pool_state_emit_min_interval_ms = 100
 # At most five Solana HTTP RPC request starts per second across every local
 # protocol engine. WebSocket push updates are not throttled by this setting.
 rpc_http_min_request_interval_ms = 200

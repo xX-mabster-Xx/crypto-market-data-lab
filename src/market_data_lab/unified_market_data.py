@@ -37,8 +37,11 @@ from market_data_lab.quote_broker import QuoteBudgetPolicy
 from market_data_lab.quote_broker import SharedQuoteBudgetManager
 from market_data_lab.realtime_scanner import MarketEvent
 from market_data_lab.realtime_scanner import RealtimeScanner
+from market_data_lab.realtime_scanner import SourceEpochChange
 from market_data_lab.solana_realtime_scanner import SolanaScannerConfig
 from market_data_lab.solana_realtime_scanner import CexBookStateSource
+from market_data_lab.solana_realtime_scanner import RaydiumLocalQuoteStateSource
+from market_data_lab.solana_realtime_scanner import build_local_route_evaluator
 from market_data_lab.solana_realtime_scanner import build_solana_market_sources
 from market_data_lab.triangle_cycle_monitor import TRIANGLE_MARKETS
 from market_data_lab.triangle_cycle_monitor import build_triangle_providers
@@ -140,6 +143,17 @@ def _build_exact_quote_sources(
 
     raydium_pacer = AsyncRequestPacer(_RAYDIUM_REQUEST_INTERVAL_SECONDS)
     jupiter_pacer = AsyncRequestPacer(config.jupiter.minimum_request_interval_seconds)
+    # These pacers are passed into provider request boundaries.  The polling
+    # source may use the same instances for shared cooldowns, but a round-level
+    # wait would not protect providers that issue separate buy/sell requests.
+    stonfi_pacer = AsyncRequestPacer(_STONFI_REQUEST_INTERVAL_SECONDS)
+    omniston_pacer = AsyncRequestPacer(_OMNISTON_REQUEST_INTERVAL_SECONDS)
+    base_evm_pacer = AsyncRequestPacer(_BASE_EVM_REQUEST_INTERVAL_SECONDS)
+    polygon_evm_pacer = AsyncRequestPacer(_POLYGON_EVM_REQUEST_INTERVAL_SECONDS)
+
+    def evm_pacer_for_chain(chain: str) -> AsyncRequestPacer:
+        return base_evm_pacer if chain == "base" else polygon_evm_pacer
+
     direct = build_cycle_providers(
         tuple(MARKETS),
         base_rpc_url=config.evm.base_rpc_http_url,
@@ -151,6 +165,9 @@ def _build_exact_quote_sources(
         stonfi_slippage_tolerance=Decimal("0.005"),
         raydium_min_request_interval_seconds=_RAYDIUM_REQUEST_INTERVAL_SECONDS,
         raydium_request_pacer=raydium_pacer,
+        evm_request_pacer={"base": base_evm_pacer, "polygon": polygon_evm_pacer},
+        stonfi_request_pacer=stonfi_pacer,
+        omniston_request_pacer=omniston_pacer,
         jupiter_api_key=config.jupiter.api_key,
         jupiter_min_request_interval_seconds=config.jupiter.minimum_request_interval_seconds,
         jupiter_request_pacer=jupiter_pacer,
@@ -170,11 +187,9 @@ def _build_exact_quote_sources(
         raydium_min_request_interval_seconds=_RAYDIUM_REQUEST_INTERVAL_SECONDS,
         stonfi_slippage_tolerance=Decimal("0.005"),
         raydium_request_pacer=raydium_pacer,
+        evm_request_pacer={"base": base_evm_pacer, "polygon": polygon_evm_pacer},
+        stonfi_request_pacer=stonfi_pacer,
     )
-    stonfi_pacer = AsyncRequestPacer(_STONFI_REQUEST_INTERVAL_SECONDS)
-    omniston_pacer = AsyncRequestPacer(_OMNISTON_REQUEST_INTERVAL_SECONDS)
-    base_evm_pacer = AsyncRequestPacer(_BASE_EVM_REQUEST_INTERVAL_SECONDS)
-    polygon_evm_pacer = AsyncRequestPacer(_POLYGON_EVM_REQUEST_INTERVAL_SECONDS)
 
     def external_pacer(provider: object) -> AsyncRequestPacer | None:
         if isinstance(provider, StonFiProvider):
@@ -183,11 +198,7 @@ def _build_exact_quote_sources(
             return omniston_pacer
         if isinstance(provider, UniswapV3Provider):
             market = getattr(provider, "market", None)
-            return (
-                base_evm_pacer
-                if getattr(market, "chain", None) == "base"
-                else polygon_evm_pacer
-            )
+            return evm_pacer_for_chain(getattr(market, "chain", "unknown"))
         return None
 
     def rate_limit_circuit_breaker_events(provider: object) -> int | None:
@@ -360,6 +371,8 @@ def build_unified_market_data_scanner(
             sequential_task = asyncio.create_task(sequential_lifecycle())
             sequential_initialized = True
 
+    route_evaluator = None
+
     async def handle_event(event: MarketEvent) -> None:
         # Initialize the sequential simulator lazily after the worker starts.
         initialize_sequential()
@@ -377,6 +390,8 @@ def build_unified_market_data_scanner(
                     quote_broker.observe_result(result)
         await analyzer.handle_event(shared_event)
         await perp_analyzer.handle_event(shared_event)
+        if route_evaluator is not None:
+            await route_evaluator.handle_event(shared_event)
 
     status_providers: dict[str, Any] = {}
     for source in (*perp_sources, *quote_sources):
@@ -393,7 +408,7 @@ def build_unified_market_data_scanner(
             sequential_task.cancel()
             await asyncio.gather(sequential_task, return_exceptions=True)
 
-    return RealtimeScanner(
+    scanner = RealtimeScanner(
         sources=sources,
         output_directory=output_directory,
         retention_seconds=config.retention_seconds,
@@ -403,15 +418,54 @@ def build_unified_market_data_scanner(
         max_events_per_key=max(config.max_events_per_key, 9_000),
         history_minimum_interval_ms=20.0,
         event_bus_capacity=max(config.event_bus_capacity, 16_384),
+        max_state_keys=getattr(config, "max_state_keys", 65_536),
         status_flush_seconds=config.status_flush_seconds,
         event_handler=handle_event,
-        status_providers=status_providers,
-        shutdown_handlers=(shutdown_sequential, analyzer.close, perp_analyzer.close, quote_broker.close),
-        epoch_change_handlers=(
-            lambda source, old_epoch, new_epoch: analyzer.handle_source_epoch_change(source, old_epoch, new_epoch),
-            lambda source, old_epoch, new_epoch: perp_analyzer.handle_source_epoch_change(source, old_epoch, new_epoch),
-        ),
     )
+    route_evaluator = build_local_route_evaluator(
+        config,
+        store=scanner.store,
+        quote_source=local_quote_source,
+        cex_sources=cex_sources,
+        output_directory=output_directory,
+    )
+
+    async def handle_source_epoch(change: SourceEpochChange) -> None:
+        # Full depth must disappear before analyzers/evaluator can observe the
+        # first market event in the replacement transport session.
+        for source in cex_sources:
+            source.handle_source_epoch(change)
+        analyzer.handle_source_epoch_change(change)
+        perp_analyzer.handle_source_epoch_change(change)
+        if route_evaluator is not None:
+            await route_evaluator.handle_source_epoch(change)
+
+    if route_evaluator is not None:
+        status_providers["local_route_evaluator"] = route_evaluator.snapshot
+    scanner.status_providers = status_providers
+    scanner.shutdown_handlers = (
+        shutdown_sequential,
+        analyzer.close,
+        perp_analyzer.close,
+        quote_broker.close,
+        *((route_evaluator.close,) if route_evaluator is not None else ()),
+    )
+    scanner.epoch_change_handlers = (handle_source_epoch,)
+    requested = bool(getattr(config.local_route_evaluator, "enabled", False))
+    scanner.runtime_components = {
+        "local_route_evaluator_requested": requested,
+        "local_route_evaluator_attached": route_evaluator is not None,
+        "local_route_count": (
+            len(route_evaluator.config.routes) if route_evaluator is not None else 0
+        ),
+        "local_quote_worker_attached": isinstance(
+            local_quote_source,
+            RaydiumLocalQuoteStateSource,
+        ),
+    }
+    if requested and getattr(config.local_route_evaluator, "routes", ()) and route_evaluator is None:
+        raise RuntimeError("local route evaluator was requested but not attached")
+    return scanner
 
 
 async def record_unified_market_data(
@@ -429,4 +483,3 @@ async def record_unified_market_data(
         hyperliquid_coins=hyperliquid_coins,
     )
     return await scanner.run(duration_seconds=duration_seconds)
-from market_data_lab.solana_realtime_scanner import RaydiumLocalQuoteStateSource

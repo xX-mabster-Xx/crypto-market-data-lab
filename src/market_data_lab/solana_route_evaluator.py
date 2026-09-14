@@ -38,6 +38,7 @@ from market_data_lab.cex_dex_cycles import _buy_base
 from market_data_lab.cex_dex_cycles import _sell_base
 from market_data_lab.realtime_scanner import MarketEvent
 from market_data_lab.realtime_scanner import RollingStateStore
+from market_data_lab.realtime_scanner import SourceEpochChange
 
 
 class ExactInputQuoteSource(Protocol):
@@ -72,6 +73,24 @@ class GatedQuoteVerifier(Protocol):
     ) -> Mapping[str, object]: ...
 
     def snapshot(self) -> Mapping[str, object]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CexDepthState:
+    """Latest bounded full-depth book plus its scanner provenance."""
+
+    book: BookSnapshot
+    source: str
+    source_epoch: int
+    event_id: str
+    received_realtime_ns: int
+    received_monotonic_ns: int
+
+
+class CexDepthProvider(Protocol):
+    """Resolve current full depth without placing it in generic history."""
+
+    def latest_depth(self, venue: str, symbol: str) -> CexDepthState | None: ...
 
 
 def _decimal(value: object, *, field_name: str) -> Decimal:
@@ -609,6 +628,7 @@ class SolanaRouteEvaluator:
     store: RollingStateStore
     quote_source: ExactInputQuoteSource
     output_directory: Path
+    depth_provider: CexDepthProvider | None = None
     gated_verifier: GatedQuoteVerifier | None = None
     _runtime: dict[str, _RouteRuntime] = field(init=False, repr=False)
     _routes_by_key: dict[str, tuple[LocalSpotRoute, ...]] = field(init=False, repr=False)
@@ -618,6 +638,9 @@ class SolanaRouteEvaluator:
     _candidate_events_dropped: int = field(default=0, init=False, repr=False)
     _persistence_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
+    _source_epochs: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _old_epoch_events_rejected: int = field(default=0, init=False, repr=False)
+    _epoch_invalidations: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._runtime = {route.route_id: _RouteRuntime() for route in self.config.routes}
@@ -636,12 +659,55 @@ class SolanaRouteEvaluator:
     async def handle_event(self, event: MarketEvent) -> None:
         if self._closed:
             return
+        current_epoch = self._source_epochs.get(event.source)
+        if current_epoch is None:
+            self._source_epochs[event.source] = event.source_epoch
+        elif event.source_epoch < current_epoch:
+            self._old_epoch_events_rejected += 1
+            return
+        elif event.source_epoch > current_epoch:
+            raise RuntimeError(
+                f"event epoch {event.source_epoch} for {event.source!r} arrived before "
+                f"SourceEpochChange from epoch {current_epoch}",
+            )
         for route in self._routes_by_key.get(event.key, ()):
             runtime = self._runtime[route.route_id]
             if runtime.task is not None and not runtime.task.done():
                 runtime.rerun_requested = True
                 continue
             runtime.task = asyncio.create_task(self._run_route(route, runtime))
+
+    async def handle_source_epoch(self, change: SourceEpochChange) -> None:
+        """Invalidate in-flight calculations before the new epoch can publish."""
+
+        current = self._source_epochs.get(change.source)
+        if current is not None and change.source_epoch <= current:
+            if change.source_epoch == current:
+                return
+            raise RuntimeError(
+                f"source epoch regressed for {change.source!r}: "
+                f"{change.source_epoch} < {current}",
+            )
+        self._source_epochs[change.source] = change.source_epoch
+        tasks = [
+            runtime.task
+            for runtime in self._runtime.values()
+            if runtime.task is not None and not runtime.task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self._persist_events(
+            self._ledger.close_all(
+                observed_realtime_ns=change.realtime_ns,
+                reason="source_epoch_advanced",
+            ),
+        )
+        for runtime in self._runtime.values():
+            runtime.rerun_requested = False
+            runtime.last_status = "waiting_for_required_state"
+        self._epoch_invalidations += 1
 
     async def close(self) -> None:
         if self._closed:
@@ -694,6 +760,10 @@ class SolanaRouteEvaluator:
             "mode": "event_driven_local_exact_pool_quote_plus_cex_depth",
             "raw_market_data_persisted": False,
             "route_count": len(self.config.routes),
+            "depth_provider_attached": self.depth_provider is not None,
+            "source_epochs": dict(sorted(self._source_epochs.items())),
+            "epoch_invalidations": self._epoch_invalidations,
+            "old_epoch_events_rejected": self._old_epoch_events_rejected,
             "candidate_lifecycle": {
                 "started": self._ledger.started,
                 "improved": self._ledger.improved,
@@ -837,18 +907,44 @@ class SolanaRouteEvaluator:
         self,
         route: LocalSpotRoute,
     ) -> tuple[MarketEvent, MarketEvent, MarketEvent | None, BookSnapshot, BookSnapshot | None] | None:
+        if self.depth_provider is None:
+            return None
         pool_event = self.store.latest(route.pool_state_key)
         base_event = self.store.latest(route.base_book_key)
         bridge_event = self.store.latest(route.bridge_book_key) if route.bridge_book_key is not None else None
         if pool_event is None or base_event is None or (route.bridge_book_key is not None and bridge_event is None):
             return None
-        base_book = base_event.value
-        bridge_book = bridge_event.value if bridge_event is not None else None
-        if not isinstance(base_book, BookSnapshot):
+        base_depth = self.depth_provider.latest_depth(route.cex_venue, route.base_cex_symbol)
+        bridge_depth = (
+            self.depth_provider.latest_depth(route.cex_venue, route.bridge_cex_symbol)
+            if route.bridge_cex_symbol is not None
+            else None
+        )
+        if base_depth is None or (route.bridge_cex_symbol is not None and bridge_depth is None):
             return None
-        if bridge_book is not None and not isinstance(bridge_book, BookSnapshot):
+        if not self._depth_matches_event(base_depth, base_event):
             return None
-        return pool_event, base_event, bridge_event, base_book, bridge_book
+        if bridge_depth is not None and (
+            bridge_event is None or not self._depth_matches_event(bridge_depth, bridge_event)
+        ):
+            return None
+        return (
+            pool_event,
+            base_event,
+            bridge_event,
+            base_depth.book,
+            bridge_depth.book if bridge_depth is not None else None,
+        )
+
+    def _depth_matches_event(self, depth: CexDepthState, event: MarketEvent) -> bool:
+        current_epoch = self._source_epochs.get(event.source, event.source_epoch)
+        return (
+            depth.source == event.source
+            and depth.source_epoch == event.source_epoch == current_epoch
+            and depth.event_id == event.event_id
+            and depth.received_realtime_ns == event.received_realtime_ns
+            and depth.received_monotonic_ns == event.received_monotonic_ns
+        )
 
     def _validate_freshness(
         self,
@@ -861,6 +957,28 @@ class SolanaRouteEvaluator:
         pool_age_ms = (now - pool_event.received_monotonic_ns) / 1_000_000
         if pool_age_ms > self.config.maximum_pool_state_age_ms:
             return "pool_state_stale"
+        if self.depth_provider is None:
+            return "cex_depth_unavailable"
+        current_base_depth = self.depth_provider.latest_depth(
+            route.cex_venue,
+            route.base_cex_symbol,
+        )
+        if current_base_depth is None or not self._depth_matches_event(
+            current_base_depth,
+            base_event,
+        ):
+            return "cex_depth_not_current"
+        if route.bridge_cex_symbol is not None:
+            current_bridge_depth = self.depth_provider.latest_depth(
+                route.cex_venue,
+                route.bridge_cex_symbol,
+            )
+            if (
+                bridge_event is None
+                or current_bridge_depth is None
+                or not self._depth_matches_event(current_bridge_depth, bridge_event)
+            ):
+                return "cex_depth_not_current"
         cex_events = [base_event] + ([bridge_event] if bridge_event is not None else [])
         if any((now - item.received_monotonic_ns) / 1_000_000 > self.config.maximum_book_age_ms for item in cex_events):
             return "cex_book_stale"

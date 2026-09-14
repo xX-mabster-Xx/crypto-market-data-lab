@@ -10,6 +10,8 @@ import {
   liquidityStateV4Layout,
 } from "@raydium-io/raydium-sdk-v2";
 
+import { closeProtocolOutput, emit } from "./protocol.js";
+
 interface PoolInput {
   pool_id: string;
   label: string;
@@ -113,14 +115,16 @@ try {
   for await (const line of lines) {
     if (line.trim().length === 0) continue;
     const result = await discover(parseInput(JSON.parse(line)));
-    process.stdout.write(`${JSON.stringify(result)}\n`);
+    emit(result);
+    await closeProtocolOutput();
     break;
   }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
-  process.stdout.write(`${JSON.stringify({
+  emit({
     type: "raydium_standard_discovery_error",
     error: message.slice(0, 512),
-  })}\n`);
+  });
+  await closeProtocolOutput().catch(() => undefined);
   process.exitCode = 1;
 }

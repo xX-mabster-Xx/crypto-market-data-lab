@@ -366,15 +366,29 @@ class RaydiumLocalQuoteWorker:
         orca_pools: Sequence[QuoteWorkerPool] = (),
         tick_cache_max_age_ms: int = 300_000,
         state_snapshot_refresh_interval_ms: int = 15_000,
+        core_refresh_after_ms: int | None = None,
+        maintenance_scan_interval_ms: int = 1_000,
+        refresh_stagger_window_ms: int = 5_000,
+        pool_state_emit_min_interval_ms: int = 100,
         rpc_http_min_request_interval_ms: int = 200,
         event_capacity: int = 2_048,
     ) -> None:
         all_pools = (*pools, *raydium_standard_pools, *meteora_pools, *orca_pools)
         if not all_pools or len({pool.pool_id for pool in all_pools}) != len(all_pools):
             raise ValueError("quote worker pools must be non-empty and unique across protocols")
+        effective_core_refresh_after_ms = (
+            state_snapshot_refresh_interval_ms
+            if core_refresh_after_ms is None
+            else core_refresh_after_ms
+        )
         if (
             tick_cache_max_age_ms <= 0
             or state_snapshot_refresh_interval_ms < 1_000
+            or effective_core_refresh_after_ms < 1_000
+            or maintenance_scan_interval_ms < 100
+            or refresh_stagger_window_ms <= 0
+            or refresh_stagger_window_ms > effective_core_refresh_after_ms
+            or pool_state_emit_min_interval_ms <= 0
             or rpc_http_min_request_interval_ms < 25
             or event_capacity <= 0
         ):
@@ -393,6 +407,10 @@ class RaydiumLocalQuoteWorker:
         }
         self.tick_cache_max_age_ms = tick_cache_max_age_ms
         self.state_snapshot_refresh_interval_ms = state_snapshot_refresh_interval_ms
+        self.core_refresh_after_ms = effective_core_refresh_after_ms
+        self.maintenance_scan_interval_ms = maintenance_scan_interval_ms
+        self.refresh_stagger_window_ms = refresh_stagger_window_ms
+        self.pool_state_emit_min_interval_ms = pool_state_emit_min_interval_ms
         self.rpc_http_min_request_interval_ms = rpc_http_min_request_interval_ms
         self.event_capacity = event_capacity
         self._process: asyncio.subprocess.Process | None = None
@@ -433,6 +451,10 @@ class RaydiumLocalQuoteWorker:
             "orca_whirlpool_pools": [pool.pool_id for pool in self.orca_pools],
             "tick_cache_max_age_ms": self.tick_cache_max_age_ms,
             "state_snapshot_refresh_interval_ms": self.state_snapshot_refresh_interval_ms,
+            "core_refresh_after_ms": self.core_refresh_after_ms,
+            "maintenance_scan_interval_ms": self.maintenance_scan_interval_ms,
+            "refresh_stagger_window_ms": self.refresh_stagger_window_ms,
+            "pool_state_emit_min_interval_ms": self.pool_state_emit_min_interval_ms,
             "rpc_http_min_request_interval_ms": self.rpc_http_min_request_interval_ms,
             "late_quote_results_dropped": self._late_quote_results_dropped,
             "late_quote_errors_dropped": self._late_quote_errors_dropped,
@@ -487,6 +509,10 @@ class RaydiumLocalQuoteWorker:
                 ],
                 "tick_cache_max_age_ms": self.tick_cache_max_age_ms,
                 "state_snapshot_refresh_interval_ms": self.state_snapshot_refresh_interval_ms,
+                "core_refresh_after_ms": self.core_refresh_after_ms,
+                "maintenance_scan_interval_ms": self.maintenance_scan_interval_ms,
+                "refresh_stagger_window_ms": self.refresh_stagger_window_ms,
+                "pool_state_emit_min_interval_ms": self.pool_state_emit_min_interval_ms,
                 "rpc_http_min_request_interval_ms": self.rpc_http_min_request_interval_ms,
             },
         )

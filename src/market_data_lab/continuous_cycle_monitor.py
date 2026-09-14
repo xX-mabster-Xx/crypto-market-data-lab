@@ -553,10 +553,15 @@ async def record_continuous_cycle_monitor(
     async def quote_worker(output: Any, market: CycleMarket) -> None:
         provider = providers[market.provider]
         gate = quote_gates.get(_provider_gate_key(market) or "")
+        request_pacer = getattr(provider, "request_pacer", None)
+        # Provider pacers run at each actual request boundary.  Waiting on the
+        # same instance here would consume one interval before every round and
+        # double-space the first request.
+        pacing = None if isinstance(request_pacer, AsyncRequestPacer) else gate
         round_id = 0
         while not stop_event.is_set():
-            if gate is not None:
-                await gate.wait()
+            if pacing is not None:
+                await pacing.wait()
             try:
                 records = await provider.quote_round(round_id, notionals)
             except asyncio.CancelledError:
@@ -625,8 +630,8 @@ async def record_continuous_cycle_monitor(
             stats.last_cex_update_at = datetime.now(UTC).isoformat()
             for market in markets_by_venue_symbol.get((venue, book.symbol), ()):
                 for record in tuple(cache_by_market[market.name].values()):
-                    received_ns = int(record.get("response_received_realtime_ns", 0))
-                    if time.time_ns() - received_ns > cache_age_ns:
+                    received_ns = int(record.get("response_received_monotonic_ns", 0))
+                    if time.monotonic_ns() - received_ns > cache_age_ns:
                         continue
                     evaluate(
                         output,

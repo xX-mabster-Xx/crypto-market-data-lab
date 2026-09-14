@@ -2,12 +2,26 @@
 
 import readline from "node:readline";
 
-import { emit, parseWorkerInput, safeError, type ConfigureMessage } from "./protocol.js";
+import {
+  closeProtocolOutput,
+  emit,
+  emitState,
+  parseWorkerInput,
+  protocolOutputMetrics,
+  safeError,
+  setProtocolOutputFatalHandler,
+  type ConfigureMessage,
+} from "./protocol.js";
 import { RaydiumClmmQuoteEngine } from "./raydiumClmm.js";
 import { MeteoraDlmmQuoteEngine } from "./meteoraDlmm.js";
 import { OrcaWhirlpoolQuoteEngine } from "./orcaWhirlpool.js";
 import { RaydiumStandardQuoteEngine } from "./raydiumStandard.js";
-import { configureRpcPacer } from "./rpcPacer.js";
+import {
+  closeRpcScheduler,
+  configureRpcPacer,
+  rpcSchedulerMetrics,
+  withRpcJobOptions,
+} from "./rpcPacer.js";
 import {
   freezeSnapshot,
   raydiumCpmmSnapshotBundle,
@@ -345,8 +359,10 @@ let closing = false;
 const inFlightQuotes = new Set<Promise<void>>();
 const MAX_IN_FLIGHT_QUOTES = 32;
 const DEFAULT_STATE_SNAPSHOT_REFRESH_INTERVAL_MS = 15_000;
+const DEFAULT_MAINTENANCE_SCAN_INTERVAL_MS = 1_000;
 const MAX_CONSECUTIVE_STATE_SNAPSHOT_ERRORS = 3;
 let stateSnapshotRefreshIntervalMs = DEFAULT_STATE_SNAPSHOT_REFRESH_INTERVAL_MS;
+let maintenanceScanIntervalMs = DEFAULT_MAINTENANCE_SCAN_INTERVAL_MS;
 let stateSnapshotRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 let stateSnapshotRefreshTask: Promise<void> | null = null;
 let stateSnapshotRefreshFailed = false;
@@ -355,6 +371,7 @@ let fatalErrorReported = false;
 
 interface SnapshotRefreshEngine {
   refreshAllPoolStates(): Promise<void>;
+  runtimeStats(): Record<string, number>;
 }
 
 function reportFatal(stage: string, error: unknown): void {
@@ -365,6 +382,12 @@ function reportFatal(stage: string, error: unknown): void {
 }
 
 function installProcessHandlers(): void {
+  setProtocolOutputFatalHandler((error) => {
+    if (fatalErrorReported) return;
+    fatalErrorReported = true;
+    process.stderr.write(`[worker-output-fatal] ${safeError(error)}\n`);
+    void shutdown(1).finally(() => process.exit(1));
+  });
   process.on("uncaughtException", (error) => reportFatal("uncaught_exception", error));
   process.on("unhandledRejection", (error) => reportFatal("unhandled_rejection", error));
 }
@@ -388,24 +411,35 @@ async function refreshStateSnapshots(): Promise<void> {
     }
   }
   const failedProtocols = Object.keys(failures);
+  const engineMetrics = Object.fromEntries(
+    engines.flatMap(([protocol, engine]) => engine === null ? [] : [[protocol, engine.runtimeStats()]]),
+  );
   if (failedProtocols.length === 0) {
     consecutiveStateSnapshotErrors = 0;
-    emit({
+    emitState("refresh_health", {
       type: "refresh_health",
       status: "ok",
-      interval_ms: stateSnapshotRefreshIntervalMs,
+      interval_ms: maintenanceScanIntervalMs,
+      core_refresh_after_ms: stateSnapshotRefreshIntervalMs,
       consecutive_errors: 0,
+      engine_metrics: engineMetrics,
+      output_metrics: protocolOutputMetrics(),
+      rpc_metrics: rpcSchedulerMetrics(),
     });
     return;
   }
   consecutiveStateSnapshotErrors += 1;
-  emit({
+  emitState("refresh_health", {
     type: "refresh_health",
     status: "error",
-    interval_ms: stateSnapshotRefreshIntervalMs,
+    interval_ms: maintenanceScanIntervalMs,
+    core_refresh_after_ms: stateSnapshotRefreshIntervalMs,
     failed_protocols: failedProtocols,
     errors: failures,
     consecutive_errors: consecutiveStateSnapshotErrors,
+    engine_metrics: engineMetrics,
+    output_metrics: protocolOutputMetrics(),
+    rpc_metrics: rpcSchedulerMetrics(),
   });
   if (consecutiveStateSnapshotErrors >= MAX_CONSECUTIVE_STATE_SNAPSHOT_ERRORS) {
     stateSnapshotRefreshFailed = true;
@@ -425,7 +459,7 @@ function scheduleStateSnapshotRefresh(): void {
       stateSnapshotRefreshTask = null;
       scheduleStateSnapshotRefresh();
     });
-  }, stateSnapshotRefreshIntervalMs);
+  }, maintenanceScanIntervalMs);
 }
 
 async function shutdown(exitCode = 0): Promise<void> {
@@ -447,6 +481,19 @@ async function shutdown(exitCode = 0): Promise<void> {
     ]);
   } catch (error) {
     emit({ type: "worker_error", stage: "shutdown", error: safeError(error) });
+    exitCode = 1;
+  }
+  try {
+    await closeRpcScheduler();
+  } catch (error) {
+    emit({ type: "worker_error", stage: "rpc_scheduler_shutdown", error: safeError(error) });
+    exitCode = 1;
+  }
+  try {
+    await closeProtocolOutput();
+  } catch (error) {
+    process.stderr.write(`[worker-output-shutdown-error] ${safeError(error)}\n`);
+    exitCode = 1;
   }
   process.exitCode = exitCode;
 }
@@ -455,31 +502,60 @@ async function configure(message: ConfigureMessage): Promise<void> {
   if (configured) throw new Error("worker already configured");
   stateSnapshotRefreshIntervalMs = message.state_snapshot_refresh_interval_ms
     ?? DEFAULT_STATE_SNAPSHOT_REFRESH_INTERVAL_MS;
+  maintenanceScanIntervalMs = message.maintenance_scan_interval_ms
+    ?? DEFAULT_MAINTENANCE_SCAN_INTERVAL_MS;
   snapshotTtlNs = BigInt(message.simulation_snapshot_ttl_ms ?? 30_000) * 1_000_000n;
-  configureRpcPacer(message.rpc_http_min_request_interval_ms);
+  configureRpcPacer(
+    message.rpc_http_min_request_interval_ms,
+    message.rpc_max_pending_jobs,
+  );
   if (message.raydium_clmm_pools.length > 0) {
     raydiumEngine = new RaydiumClmmQuoteEngine({
-      onPoolState: (notice) => emit({ type: "pool_state", protocol: "raydium_clmm", ...notice }),
+      onPoolState: (notice) => emitState(
+        `pool_state:raydium_clmm:${notice.pool_id}`,
+        { type: "pool_state", protocol: "raydium_clmm", ...notice },
+      ),
     });
-    await raydiumEngine.open(message);
+    await withRpcJobOptions(
+      { priority: "bootstrap", description: "bootstrap Raydium CLMM engine" },
+      () => raydiumEngine!.open(message),
+    );
   }
   if (message.raydium_standard_pools.length > 0) {
     raydiumStandardEngine = new RaydiumStandardQuoteEngine({
-      onPoolState: (protocol, notice) => emit({ type: "pool_state", protocol, ...notice }),
+      onPoolState: (protocol, notice) => emitState(
+        `pool_state:${protocol}:${notice.pool_id}`,
+        { type: "pool_state", protocol, ...notice },
+      ),
     });
-    await raydiumStandardEngine.open(message);
+    await withRpcJobOptions(
+      { priority: "bootstrap", description: "bootstrap Raydium standard engine" },
+      () => raydiumStandardEngine!.open(message),
+    );
   }
   if (message.meteora_dlmm_pools.length > 0) {
     meteoraEngine = new MeteoraDlmmQuoteEngine({
-      onPoolState: (notice) => emit({ type: "pool_state", protocol: "meteora_dlmm", ...notice }),
+      onPoolState: (notice) => emitState(
+        `pool_state:meteora_dlmm:${notice.pool_id}`,
+        { type: "pool_state", protocol: "meteora_dlmm", ...notice },
+      ),
     });
-    await meteoraEngine.open(message);
+    await withRpcJobOptions(
+      { priority: "bootstrap", description: "bootstrap Meteora DLMM engine" },
+      () => meteoraEngine!.open(message),
+    );
   }
   if (message.orca_whirlpool_pools.length > 0) {
     orcaEngine = new OrcaWhirlpoolQuoteEngine({
-      onPoolState: (notice) => emit({ type: "pool_state", protocol: "orca_whirlpool", ...notice }),
+      onPoolState: (notice) => emitState(
+        `pool_state:orca_whirlpool:${notice.pool_id}`,
+        { type: "pool_state", protocol: "orca_whirlpool", ...notice },
+      ),
     });
-    await orcaEngine.open(message);
+    await withRpcJobOptions(
+      { priority: "bootstrap", description: "bootstrap Orca Whirlpool engine" },
+      () => orcaEngine!.open(message),
+    );
   }
   configured = true;
   emit({
@@ -501,8 +577,15 @@ async function configure(message: ConfigureMessage): Promise<void> {
     meteora_dlmm_pool_count: message.meteora_dlmm_pools.length,
     orca_whirlpool_pool_count: message.orca_whirlpool_pools.length,
     state_snapshot_refresh_interval_ms: stateSnapshotRefreshIntervalMs,
+    core_refresh_after_ms: message.core_refresh_after_ms ?? stateSnapshotRefreshIntervalMs,
+    maintenance_scan_interval_ms: maintenanceScanIntervalMs,
+    refresh_stagger_window_ms: message.refresh_stagger_window_ms ?? 5_000,
+    pool_state_emit_min_interval_ms: message.pool_state_emit_min_interval_ms ?? 100,
     simulation_snapshot_ttl_ms: Number(snapshotTtlNs / 1_000_000n),
     rpc_http_min_request_interval_ms: message.rpc_http_min_request_interval_ms ?? 200,
+    rpc_max_pending_jobs: rpcSchedulerMetrics().rpc_queue_capacity,
+    output_metrics: protocolOutputMetrics(),
+    rpc_metrics: rpcSchedulerMetrics(),
     wallet_or_private_key_used: false,
     transactions_submitted: false,
     simulation_capabilities: {
@@ -525,13 +608,19 @@ async function handleQuote(message: Extract<ReturnType<typeof parseWorkerInput>,
     const activeRaydiumStandard = raydiumStandardEngine as RaydiumStandardQuoteEngine | null;
     const activeMeteora = meteoraEngine as MeteoraDlmmQuoteEngine | null;
     const activeOrca = orcaEngine as OrcaWhirlpoolQuoteEngine | null;
-    const quote = message.protocol === "raydium_clmm"
-      ? await activeRaydium?.quote(message)
-      : message.protocol === "raydium_cpmm" || message.protocol === "raydium_amm_v4"
-        ? await activeRaydiumStandard?.quote(message)
-        : message.protocol === "meteora_dlmm"
-          ? await activeMeteora?.quote(message)
-          : await activeOrca?.quote(message);
+    const quote = await withRpcJobOptions(
+      {
+        priority: "interactive",
+        description: `quote ${message.protocol}:${message.pool_id}`,
+      },
+      async () => message.protocol === "raydium_clmm"
+        ? activeRaydium?.quote(message)
+        : message.protocol === "raydium_cpmm" || message.protocol === "raydium_amm_v4"
+          ? activeRaydiumStandard?.quote(message)
+          : message.protocol === "meteora_dlmm"
+            ? activeMeteora?.quote(message)
+            : activeOrca?.quote(message),
+    );
     if (quote === undefined) throw new Error(`protocol ${message.protocol} is not configured`);
     emit({ type: "quote_result", protocol: message.protocol, ...quote });
   } catch (error) {

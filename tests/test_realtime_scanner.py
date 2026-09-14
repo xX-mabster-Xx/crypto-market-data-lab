@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -100,8 +101,155 @@ class RealtimeScannerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(observed_timeouts, [1.0, 2.0, 2.0])
         self.assertEqual(scanner.snapshot(status="running")["sources"][source.name]["restarts"], 3)
 
+    async def test_stable_run_resets_retry_backoff(self) -> None:
+        source = _FailingSource()
+        source.supervisor_retry_initial_seconds = 0.25
+        source.supervisor_retry_max_seconds = 4.0
+        scanner = RealtimeScanner(
+            sources=[source],
+            output_directory=Path(tempfile.gettempdir()) / "unused-scanner-output",
+            supervisor_retry_reset_after_seconds=30.0,
+        )
+        observed_timeouts: list[float] = []
+
+        async def fake_wait_for(awaitable: Any, *, timeout: float) -> bool:
+            observed_timeouts.append(timeout)
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            if len(observed_timeouts) == 2:
+                scanner.stop_event.set()
+                return True
+            raise TimeoutError
+
+        # First failure is rapid.  The second failure follows a stable
+        # 31-second run and must therefore use the initial delay again.
+        monotonic_values = iter((0.0, 0.1, 0.1, 31.1))
+        with (
+            patch("market_data_lab.realtime_scanner.time.monotonic", side_effect=monotonic_values),
+            patch("market_data_lab.realtime_scanner.asyncio.wait_for", new=fake_wait_for),
+        ):
+            await scanner._source_supervisor(source)
+
+        self.assertEqual(observed_timeouts, [0.25, 0.25])
+
 
 class RollingStateStoreTest(unittest.TestCase):
+    @staticmethod
+    def _event(key: str, *, monotonic_ns: int, source_epoch: int = 1) -> MarketEvent:
+        return MarketEvent(
+            "feed",
+            key,
+            "quote",
+            {"key": key, "monotonic_ns": monotonic_ns},
+            {},
+            monotonic_ns,
+            monotonic_ns,
+            event_id=f"{key}:{monotonic_ns}",
+            source_epoch=source_epoch,
+            boot_id="boot-a",
+        )
+
+    def test_idle_key_is_physically_retired_by_sweep(self) -> None:
+        store = RollingStateStore(
+            retention_seconds=1,
+            max_events_per_key=8,
+            max_state_keys=8,
+            boot_id="boot-a",
+        )
+        self.assertTrue(store.add(self._event("idle", monotonic_ns=1_000_000_000)))
+
+        retired = store.sweep(now_monotonic_ns=2_000_000_001)
+
+        self.assertEqual(retired, ("idle",))
+        self.assertIsNone(store.latest("idle"))
+        self.assertEqual(store.recent("idle"), ())
+        self.assertIsNone(store._versioned.latest("idle"))
+        self.assertEqual(store._versioned.snapshot()["states"], 0)
+
+    def test_max_state_keys_is_enforced_on_admission_and_is_deterministic(self) -> None:
+        store = RollingStateStore(
+            retention_seconds=60,
+            max_events_per_key=8,
+            max_state_keys=2,
+            boot_id="boot-a",
+        )
+
+        for index, key in enumerate(("old", "middle", "new"), start=1):
+            self.assertTrue(store.add(self._event(key, monotonic_ns=index)))
+
+        self.assertEqual(set(store._latest), {"middle", "new"})
+        self.assertIsNone(store.latest("old"))
+        self.assertEqual(store._versioned.snapshot()["states"], 2)
+        self.assertEqual(store.snapshot(now_monotonic_ns=3)["capacity_evictions"], 1)
+
+    def test_capacity_eviction_keeps_recent_active_key(self) -> None:
+        store = RollingStateStore(
+            retention_seconds=60,
+            max_events_per_key=8,
+            max_state_keys=3,
+            boot_id="boot-a",
+        )
+        for key, timestamp in (("old-a", 1), ("old-b", 2), ("active", 100)):
+            self.assertTrue(store.add(self._event(key, monotonic_ns=timestamp)))
+
+        self.assertTrue(store.add(self._event("new", monotonic_ns=101)))
+
+        self.assertIsNotNone(store.latest("active"))
+        self.assertIsNone(store.latest("old-a"))
+        self.assertEqual(len(store._latest), 3)
+
+    def test_health_counters_only_advance_on_accepted_state(self) -> None:
+        async def exercise() -> None:
+            scanner = RealtimeScanner(
+                sources=[_OneEventSource()],
+                output_directory=Path(tempfile.gettempdir()) / "unused-scanner-output",
+            )
+            first = MarketEvent(
+                source="test:source",
+                key="health:key",
+                kind="quote",
+                value="first",
+                summary={},
+                received_realtime_ns=1,
+                received_monotonic_ns=1,
+                event_id="health:event:1",
+                chain_position=2,
+            )
+            duplicate = replace(first)
+
+            self.assertTrue((await scanner._publish(first)).accepted)
+            scanner._health[first.source].record_error("transport failure")
+            self.assertFalse((await scanner._publish(duplicate)).accepted)
+            out_of_order = replace(
+                first,
+                event_id="health:event:older",
+                chain_position=1,
+                received_realtime_ns=2,
+                received_monotonic_ns=2,
+            )
+            self.assertFalse((await scanner._publish(out_of_order)).accepted)
+
+            health = scanner.snapshot(status="running")["sources"][first.source]
+            self.assertEqual(health["received_events"], 3)
+            self.assertEqual(health["accepted_events"], 1)
+            self.assertEqual(health["rejected_events"], 2)
+            self.assertEqual(health["last_error"], "transport failure")
+
+            accepted_after_error = replace(
+                first,
+                event_id="health:event:2",
+                value="second",
+                received_realtime_ns=3,
+                received_monotonic_ns=3,
+                chain_position=3,
+            )
+            self.assertTrue((await scanner._publish(accepted_after_error)).accepted)
+            health = scanner.snapshot(status="running")["sources"][first.source]
+            self.assertEqual(health["accepted_events"], 2)
+            self.assertIsNone(health["last_error"])
+
+        asyncio.run(exercise())
     def test_history_can_coalesce_without_delaying_latest_state(self) -> None:
         store = RollingStateStore(
             retention_seconds=60,
@@ -200,7 +348,7 @@ class RollingStateStoreTest(unittest.TestCase):
         self.assertTrue(store.add(replacement))
         self.assertIs(store.latest("book:A"), replacement)
         self.assertIsNone(store.latest("book:B"))
-        self.assertEqual(store.recent("book:B")[-1].value, "book:B")
+        self.assertEqual(store.recent("book:B"), ())
 
 
 if __name__ == "__main__":

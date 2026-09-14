@@ -202,7 +202,11 @@ class QuoteBrokerTest(unittest.IsolatedAsyncioTestCase):
         served_from_values = {result.served_from for result in results}
         self.assertIn("remote", served_from_values)
         self.assertIn("inflight_shared", served_from_values)
-        self.assertTrue(len(results) == 10)
+        self.assertEqual(len(results), 10)
+        self.assertEqual({result.status for result in results}, {"ok"})
+        self.assertEqual({result.key for result in results}, {key})
+        self.assertEqual(sum(result.served_from == "remote" for result in results), 1)
+        self.assertEqual(sum(result.served_from == "inflight_shared" for result in results), 9)
         self.assertEqual(broker._counts["inflight_joins"], 9)
         # Follow-up after completion should take cache (within TTL).
         clock.advance(nanoseconds=10_000_000)
@@ -210,6 +214,63 @@ class QuoteBrokerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(third.served_from, "cache")
         self.assertEqual(calls, 1)
         await broker.close()
+
+    async def test_remote_key_mismatch_is_accounted_and_gated(self) -> None:
+        clock = _Clock()
+        calls = 0
+
+        async def backend(request: QuoteRequest) -> QuoteResult:
+            nonlocal calls
+            calls += 1
+            wrong_request = _request(clock, "wrong-key", _key(amount_raw=999))
+            return _ok_result(clock, wrong_request)
+
+        broker = QuoteBroker(
+            backends={"TEST": backend},
+            budgets=_budgets("vendor:test"),
+            monotonic_ns=clock.monotonic_ns,
+            realtime_ns=clock.realtime_ns,
+        )
+        request = _request(clock, "mismatch", _key())
+
+        first = await broker.get_quote(request)
+        second = await broker.get_quote(_request(clock, "retry", request.key))
+
+        self.assertEqual(first.status, "provider_error")
+        self.assertEqual(first.reason, "quote_backend_key_mismatch")
+        self.assertEqual(second.status, "provider_error")
+        self.assertEqual(second.reason, "provider_error_backoff_active")
+        self.assertEqual(calls, 1)
+        self.assertEqual(broker.snapshot()["failure_gates"]["endpoint_scoped"], 1)
+
+    async def test_local_key_mismatch_uses_the_same_failure_gate(self) -> None:
+        clock = _Clock()
+        calls = 0
+
+        async def backend(request: QuoteRequest) -> QuoteResult:
+            nonlocal calls
+            calls += 1
+            wrong_request = _request(clock, "wrong-key", _key(provider="LOCAL", amount_raw=999))
+            return _ok_result(clock, wrong_request)
+
+        broker = QuoteBroker(
+            backends={},
+            budgets=_budgets("vendor:test"),
+            monotonic_ns=clock.monotonic_ns,
+            realtime_ns=clock.realtime_ns,
+        )
+        broker.register_local_backend("LOCAL", backend)
+        key = _key(provider="LOCAL")
+
+        first = await broker.simulate_local_path(_request(clock, "mismatch", key))
+        second = await broker.simulate_local_path(_request(clock, "retry", key))
+
+        self.assertEqual(first.status, "provider_error")
+        self.assertEqual(first.reason, "local_backend_key_mismatch")
+        self.assertEqual(second.status, "provider_error")
+        self.assertEqual(second.reason, "provider_error_backoff_active")
+        self.assertEqual(calls, 1)
+        self.assertEqual(broker.snapshot()["failure_gates"]["endpoint_scoped"], 1)
 
     async def test_simulation_backend_is_deduped_without_remote_quota(self) -> None:
         clock = _Clock()

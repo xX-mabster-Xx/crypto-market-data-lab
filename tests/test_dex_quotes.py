@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 import urllib.parse
 from decimal import Decimal
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from market_data_lab.dex_quotes import Asset
 from market_data_lab.dex_quotes import AsyncRequestPacer
+from market_data_lab.dex_quotes import DexQuoteProvider
 from market_data_lab.dex_quotes import EvmMarket
 from market_data_lab.dex_quotes import JupiterProvider
 from market_data_lab.dex_quotes import OMNISTON_QUOTE_METHOD
@@ -29,6 +31,9 @@ def _quoter_result(*values: int) -> str:
 
 
 class DexQuoteEncodingTest(unittest.TestCase):
+    def test_provider_protocol_declares_config_capability(self) -> None:
+        self.assertIn("config", DexQuoteProvider.__dict__)
+
     def test_quoter_v2_static_tuple_encoding(self) -> None:
         value = encode_quoter_v2_exact_input_single(
             "0x4200000000000000000000000000000000000006",
@@ -77,6 +82,62 @@ class DexQuoteEncodingTest(unittest.TestCase):
 
 
 class ProviderNormalizationTest(unittest.TestCase):
+    def test_uniswap_paces_each_buy_and_sell_rpc_batch(self) -> None:
+        starts: list[int] = []
+
+        def fetch(
+            url: str,
+            method: str,
+            body: bytes | None,
+            headers: dict[str, str],
+            proxy_url: str | None,
+            timeout_seconds: float,
+        ) -> object:
+            starts.append(time.monotonic_ns())
+            calls = json.loads(body or b"[]")
+            response: list[dict[str, object]] = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": {"number": "0x64", "timestamp": "0xc8", "hash": "0xabc"},
+                },
+            ]
+            for call in calls:
+                if call["method"] == "eth_call":
+                    response.append(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": call["id"],
+                            "result": _quoter_result(10**18, 2, 3, 4),
+                        },
+                    )
+            return response
+
+        market = EvmMarket(
+            provider="TEST_UNISWAP",
+            chain="test",
+            chain_id=1,
+            protocol="Uniswap v3",
+            rpc_url="https://rpc.example.test/key",
+            block_tag="latest",
+            quoter_address="0x1111111111111111111111111111111111111111",
+            base=Asset("WETH", "0x2222222222222222222222222222222222222222", 18),
+            quote=Asset("USDC", "0x3333333333333333333333333333333333333333", 6),
+            fee_tiers=(500,),
+        )
+        provider = UniswapV3Provider(
+            market,
+            proxy_url=None,
+            timeout_seconds=1,
+            request_pacer=AsyncRequestPacer(0.02),
+            fetch_json=fetch,
+        )
+
+        asyncio.run(provider.quote_round(7, [Decimal("100")]))
+
+        self.assertEqual(len(starts), 2)
+        self.assertGreaterEqual(starts[1] - starts[0], 15_000_000)
+
     def test_uniswap_records_both_sides_from_batch_eth_call(self) -> None:
         invocations = 0
 

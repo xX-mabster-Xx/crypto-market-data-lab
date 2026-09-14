@@ -278,7 +278,13 @@ export function raydiumCpmmSnapshotBundle(
     boot_id: bootId,
     model_version: MODEL_VERSION,
     pool_refs: poolRefs,
-    dependency_vector: [],
+    dependency_vector: states.flatMap((state) => state.core_state_slot === undefined ? [] : [{
+      pool_id: canonicalPoolId(state),
+      core_state_slot: state.core_state_slot,
+      dependency_slot_min: state.dependency_slot_min ?? null,
+      dependency_slot_max: state.dependency_slot_max ?? null,
+      dependency_generation: state.dependency_generation ?? 0,
+    }]),
     pools,
     context_slot: contextSlot,
     chain_consistency: "validated_multi_account_snapshot",
@@ -290,6 +296,10 @@ export function raydiumCpmmSnapshotBundle(
 export interface OrcaWhirlpoolSimulationState {
   pool_id: string;
   slot: number;
+  core_state_slot?: number;
+  dependency_slot_min?: number | null;
+  dependency_slot_max?: number | null;
+  dependency_generation?: number;
   token_a_mint: string;
   token_b_mint: string;
   token_a_decimals: number;
@@ -430,7 +440,13 @@ export function orcaWhirlpoolSnapshotBundle(
     boot_id: bootId,
     model_version: ORCA_MODEL_VERSION,
     pool_refs: poolRefs,
-    dependency_vector: [],
+    dependency_vector: states.flatMap((state) => state.core_state_slot === undefined ? [] : [{
+      pool_id: orcaCanonicalPoolId(state.pool_id),
+      core_state_slot: state.core_state_slot,
+      dependency_slot_min: state.dependency_slot_min ?? null,
+      dependency_slot_max: state.dependency_slot_max ?? null,
+      dependency_generation: state.dependency_generation ?? 0,
+    }]),
     pools,
     context_slot: contextSlot,
     chain_consistency: "validated_multi_account_snapshot",

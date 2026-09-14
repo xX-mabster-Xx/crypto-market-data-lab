@@ -21,7 +21,7 @@ import asyncio
 import json
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -41,6 +41,7 @@ from market_data_lab.live_common import atomic_json
 from market_data_lab.numeric_text import canonical_decimal_text
 from market_data_lab.polling_quote_sources import ExactInputQuote
 from market_data_lab.realtime_scanner import MarketEvent
+from market_data_lab.realtime_scanner import SourceEpochChange
 from market_data_lab.rolling_cycle_monitor import DEFAULT_CEX_TAKER_FEES
 from market_data_lab.solana_realtime_scanner import CexBookStateSource
 from market_data_lab.triangle_cycle_monitor import TRIANGLE_MARKETS
@@ -60,7 +61,7 @@ DEFAULT_PUBLIC_SPOT_TAKER_FEES: dict[str, Decimal] = {
 
 
 def _decimal_text(value: Decimal | None) -> str | None:
-    return format(value, "f") if value is not None else None
+    return canonical_decimal_text(value) if value is not None else None
 
 
 def _utc_iso_from_ns(value: int) -> str:
@@ -70,7 +71,7 @@ def _utc_iso_from_ns(value: int) -> str:
 def _notional_key(value: Decimal | None) -> str | None:
     if value is None or not value.is_finite() or value <= 0:
         return None
-    return format(value, "f")
+    return canonical_decimal_text(value)
 
 
 @dataclass
@@ -107,6 +108,8 @@ class UnifiedCycleAnalyzer:
         minimum_net_edge_bps: Decimal = Decimal("0"),
         coalesce_interval_ms: float = 50.0,
         max_candidate_events: int = 5_000,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        realtime_ns: Callable[[], int] = time.time_ns,
     ) -> None:
         if max_response_skew_ms <= 0 or not max_response_skew_ms.is_finite():
             raise ValueError("max_response_skew_ms must be finite and positive")
@@ -128,6 +131,8 @@ class UnifiedCycleAnalyzer:
         self.minimum_net_edge_bps = minimum_net_edge_bps
         self.coalesce_interval_seconds = coalesce_interval_ms / 1_000
         self.max_candidate_events = max_candidate_events
+        self._monotonic_ns = monotonic_ns
+        self._realtime_ns = realtime_ns
         self._spot_cex_sources = {
             source.config.venue.upper(): source
             for source in cex_sources
@@ -138,6 +143,8 @@ class UnifiedCycleAnalyzer:
         self._triangle_markets = {market.provider: market for market in TRIANGLE_MARKETS}
         self._direct_quotes: dict[tuple[str, str, str], ExactInputQuote] = {}
         self._triangle_quotes: dict[tuple[str, str, str], ExactInputQuote] = {}
+        self._quote_provenance: dict[tuple[str, str, str], tuple[str, int]] = {}
+        self._current_source_epochs: dict[str, int] = {}
         self._quote_keys_by_direct_provider: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
         self._quote_keys_by_triangle_provider: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
         self._direct_by_book: dict[tuple[str, str], set[str]] = defaultdict(set)
@@ -168,9 +175,29 @@ class UnifiedCycleAnalyzer:
                 self._triangle_by_book[(venue, cex_symbol(market.base, venue))].add(provider)
                 self._triangle_by_book[(venue, cex_symbol(market.quote, venue))].add(provider)
 
-    def handle_source_epoch_change(self, source: str, old_epoch: int, new_epoch: int) -> None:
-        """Purge all cached evidence from the old source epoch."""
-        self._purge_source_epoch(source, old_epoch)
+    def handle_source_epoch_change(
+        self,
+        change: SourceEpochChange | str,
+        old_epoch: int | None = None,
+        new_epoch: int | None = None,
+    ) -> None:
+        """Purge cached evidence before the first event in a new epoch."""
+
+        if isinstance(change, SourceEpochChange):
+            source = change.source
+            epoch = change.source_epoch
+        else:
+            if new_epoch is None:
+                raise TypeError("new_epoch is required for the legacy epoch callback")
+            source = change
+            epoch = new_epoch
+        current = self._current_source_epochs.get(source)
+        if current is not None and epoch <= current:
+            if epoch == current:
+                return
+            raise RuntimeError(f"source epoch regressed for {source!r}: {epoch} < {current}")
+        self._current_source_epochs[source] = epoch
+        self._purge_source_epoch(source, old_epoch=epoch - 1)
 
     def _remove_quote_key(self, key: tuple[str, str, str]) -> bool:
         """Remove a quote key from primary cache and all secondary indexes.
@@ -178,6 +205,7 @@ class UnifiedCycleAnalyzer:
         Returns True if the key was present and removed.
         """
         provider = key[0]
+        self._quote_provenance.pop(key, None)
         if key in self._direct_quotes:
             self._direct_quotes.pop(key, None)
             self._quote_keys_by_direct_provider[provider].discard(key)
@@ -211,20 +239,55 @@ class UnifiedCycleAnalyzer:
         """Purge quotes belonging to a source epoch that no longer owns them."""
         invalidated = 0
         for key in list(self._direct_quotes.keys()):
-            quote = self._direct_quotes.get(key)
-            if quote is not None and quote.source_epoch <= old_epoch:
+            provenance = self._quote_provenance.get(key)
+            if provenance is not None and provenance[0] == source and provenance[1] <= old_epoch:
                 if self._remove_quote_key(key):
                     invalidated += 1
         for key in list(self._triangle_quotes.keys()):
-            quote = self._triangle_quotes.get(key)
-            if quote is not None and quote.source_epoch <= old_epoch:
+            provenance = self._quote_provenance.get(key)
+            if provenance is not None and provenance[0] == source and provenance[1] <= old_epoch:
                 if self._remove_quote_key(key):
                     invalidated += 1
         self._dirty_direct.clear()
         self._dirty_triangle.clear()
-        self._active.clear()
+        now_realtime_ns = self._realtime_ns()
+        now_monotonic_ns = self._monotonic_ns()
+        for key, state in tuple(self._active.items()):
+            self._active.pop(key)
+            self._candidate_closed += 1
+            self._persist_candidate_event(
+                self._candidate_event(
+                    "candidate_closed",
+                    state,
+                    observed_realtime_ns=now_realtime_ns,
+                    observed_monotonic_ns=now_monotonic_ns,
+                    close_reason="source_epoch_advanced",
+                ),
+            )
         self._counts["epoch_invalidated_quotes"] += invalidated
         return invalidated
+
+    def _accept_event_epoch(self, event: MarketEvent) -> bool:
+        current = self._current_source_epochs.get(event.source)
+        if current is None:
+            self._current_source_epochs[event.source] = event.source_epoch
+            return True
+        if event.source_epoch < current:
+            self._counts["old_epoch_events_rejected"] += 1
+            return False
+        if event.source_epoch > current:
+            raise RuntimeError(
+                f"event epoch {event.source_epoch} for {event.source!r} arrived before "
+                f"SourceEpochChange from epoch {current}",
+            )
+        return True
+
+    def _quote_is_current(self, key: tuple[str, str, str]) -> bool:
+        provenance = self._quote_provenance.get(key)
+        if provenance is None:
+            return False
+        source, epoch = provenance
+        return self._current_source_epochs.get(source, epoch) == epoch
 
     def _prune_expired_quotes(self, now_monotonic_ns: int) -> int:
         """Physically remove quotes older than the freshness TTL."""
@@ -334,6 +397,8 @@ class UnifiedCycleAnalyzer:
 
         if self._closed:
             return
+        if not self._accept_event_epoch(event):
+            return
         self._ensure_worker()
         self._counts["events_seen"] += 1
         if event.kind == "exact_input_quote" and isinstance(event.value, ExactInputQuote):
@@ -349,12 +414,14 @@ class UnifiedCycleAnalyzer:
             if key is not None:
                 if quote.provider in self._direct_markets:
                     self._direct_quotes[key] = quote
+                    self._quote_provenance[key] = (event.source, event.source_epoch)
                     self._quote_keys_by_direct_provider[quote.provider].add(key)
                     for venue in self._spot_cex_sources:
                         self._schedule_direct(key, venue)
                     self._counts["direct_quote_events"] += 1
                 elif quote.provider in self._triangle_markets:
                     self._triangle_quotes[key] = quote
+                    self._quote_provenance[key] = (event.source, event.source_epoch)
                     self._quote_keys_by_triangle_provider[quote.provider].add(key)
                     for venue in self._spot_cex_sources:
                         self._schedule_triangle(key, venue)
@@ -405,7 +472,7 @@ class UnifiedCycleAnalyzer:
                 try:
                     await self._drain_dirty()
                     self._close_stale_candidates()
-                    self._prune_expired_quotes(time.monotonic_ns())
+                    self._prune_expired_quotes(self._monotonic_ns())
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -466,7 +533,14 @@ class UnifiedCycleAnalyzer:
         market = self._direct_markets.get(provider)
         quote = self._direct_quotes.get(key)
         source = self._spot_cex_sources.get(venue)
-        if market is None or quote is None or source is None:
+        if (
+            market is None
+            or quote is None
+            or source is None
+            or not self._quote_is_current(key)
+            or self._current_source_epochs.get(source.name, source.source_epoch)
+            != source.source_epoch
+        ):
             return
         record = self._quote_record(quote)
         if record is None:
@@ -574,7 +648,14 @@ class UnifiedCycleAnalyzer:
         market = self._triangle_markets.get(provider)
         quote = self._triangle_quotes.get(key)
         source = self._spot_cex_sources.get(venue)
-        if market is None or quote is None or source is None:
+        if (
+            market is None
+            or quote is None
+            or source is None
+            or not self._quote_is_current(key)
+            or self._current_source_epochs.get(source.name, source.source_epoch)
+            != source.source_epoch
+        ):
             return
         record = self._quote_record(quote)
         if record is None:
@@ -920,8 +1001,8 @@ class UnifiedCycleAnalyzer:
         )
 
     def _close_stale_candidates(self) -> None:
-        now_realtime_ns = time.time_ns()
-        now_monotonic_ns = time.monotonic_ns()
+        now_realtime_ns = self._realtime_ns()
+        now_monotonic_ns = self._monotonic_ns()
         max_idle_ns = int(self.max_response_skew_ms * Decimal(1_000_000))
         for key, state in tuple(self._active.items()):
             if now_monotonic_ns - state.last_seen_monotonic_ns <= max_idle_ns:
@@ -955,7 +1036,7 @@ class UnifiedCycleAnalyzer:
             "status": "closed" if self._closed else "running",
             "mode": "event_driven_unified_cycle_analysis",
             "started_at": self._started_at,
-            "updated_at": datetime.now(UTC).isoformat(),
+            "updated_at": _utc_iso_from_ns(self._realtime_ns()),
             "collector_connections_opened_by_analyzer": 0,
             "raw_market_data_persisted": False,
             "candidate_event_persistence": {
@@ -977,6 +1058,7 @@ class UnifiedCycleAnalyzer:
                 "fee_audit_load_error": self._fee_audit_error,
             },
             "counts": dict(sorted(self._counts.items())),
+            "source_epochs": dict(sorted(self._current_source_epochs.items())),
            "candidate_lifecycle": {
                "started": self._candidate_started,
                "improved": self._candidate_improved,
@@ -992,6 +1074,7 @@ class UnifiedCycleAnalyzer:
                 ),
                 "rejected_state_events": (
                     self._counts.get("old_epoch_quotes_rejected", 0)
+                    + self._counts.get("old_epoch_events_rejected", 0)
                     + self._counts.get("unmapped_exact_quote_events", 0)
                     + self._counts.get("malformed_exact_quote_events", 0)
                 ),
@@ -1011,7 +1094,7 @@ class UnifiedCycleAnalyzer:
                     self._counts.get("stale_quote_prunes", 0)
                     + self._counts.get("epoch_invalidated_quotes", 0)
                 ),
-                "source_epoch": self._counts.get("source_epoch", 0),
+                "source_epoch": max(self._current_source_epochs.values(), default=0),
                 "source_restarts": self._counts.get("source_restarts", 0),
                 "last_accepted_event_age_ms": None,
                 "last_error": (
@@ -1042,7 +1125,7 @@ class UnifiedCycleAnalyzer:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-        now = time.time_ns()
+        now = self._realtime_ns()
         for key, state in tuple(self._active.items()):
             self._active.pop(key)
             self._candidate_closed += 1
@@ -1051,7 +1134,7 @@ class UnifiedCycleAnalyzer:
                     "candidate_closed",
                     state,
                     observed_realtime_ns=now,
-                    observed_monotonic_ns=time.monotonic_ns(),
+                    observed_monotonic_ns=self._monotonic_ns(),
                     close_reason="scanner_shutdown",
                 ),
             )

@@ -22,7 +22,7 @@ import statistics
 import time
 import urllib.parse
 from collections import defaultdict, deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -805,11 +805,20 @@ class MexcPartialDepthStream:
         if self._receiver is not None:
             raise RuntimeError("MEXC websocket stream is already started")
         self._stopping = False
+        self._error = None
+        self._latest.clear()
+        for history in self._history.values():
+            history.clear()
+        while not self._updates.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._updates.get_nowait()
+        self._updated.clear()
         self._receiver = asyncio.create_task(self._receive_loop())
         deadline = time.monotonic() + self.timeout_seconds
         target = set(self.symbols)
         try:
             while set(self._latest) != target:
+                self._raise_receiver_failure()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     if not self.require_all_initial_books and self._latest:
@@ -817,77 +826,93 @@ class MexcPartialDepthStream:
                     missing = ", ".join(sorted(target - set(self._latest)))
                     detail = f"; last connection error: {self._error}" if self._error else ""
                     raise TimeoutError(f"MEXC websocket initial books timed out: {missing}{detail}")
-                try:
-                    await asyncio.wait_for(self._updated.wait(), timeout=remaining)
-                finally:
-                    self._updated.clear()
+                updated = asyncio.create_task(self._updated.wait())
+                done, _ = await asyncio.wait(
+                    (updated, self._receiver),
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                updated.cancel()
+                await asyncio.gather(updated, return_exceptions=True)
+                self._updated.clear()
+                if self._receiver in done:
+                    self._raise_receiver_failure()
         except Exception:
             await self.close()
             raise
 
+    def _raise_receiver_failure(self) -> None:
+        receiver = self._receiver
+        if receiver is None:
+            raise RuntimeError("MEXC websocket stream is not running")
+        if not receiver.done():
+            return
+        try:
+            exc = receiver.exception()
+        except asyncio.CancelledError:
+            raise
+        if exc is not None:
+            raise RuntimeError(f"MEXC websocket transport failed: {exc}") from exc
+        raise RuntimeError("MEXC websocket receiver exited unexpectedly")
+
     async def _receive_loop(self) -> None:
-        delay_seconds = 0.25
         channels = [
             f"spot@public.limit.depth.v3.api.pb@{symbol}@{self.levels}"
             for symbol in self.symbols
         ]
-        while not self._stopping:
-            websocket: Any = None
-            try:
-                websocket = await self.connect_websocket(
-                    self.endpoint,
-                    open_timeout=self.timeout_seconds,
-                    close_timeout=1,
-                    ping_interval=20,
-                    ping_timeout=20,
-                    proxy=self.proxy_url,
-                )
-                self._websocket = websocket
-                await websocket.send(
-                    json.dumps({"method": "SUBSCRIPTION", "params": channels}, separators=(",", ":")),
-                )
-                delay_seconds = 0.25
-                while not self._stopping:
-                    raw = await websocket.recv()
-                    if not isinstance(raw, bytes):
-                        continue
-                    received_realtime_ns = time.time_ns()
-                    received_monotonic_ns = time.monotonic_ns()
-                    try:
-                        snapshot = parse_mexc_partial_depth_message(
-                            raw,
-                            received_realtime_ns=received_realtime_ns,
-                            received_monotonic_ns=received_monotonic_ns,
-                        )
-                    except (InvalidOperation, ValueError):
-                        continue
-                    if snapshot.symbol not in self.symbols:
-                        continue
-                    self._latest[snapshot.symbol] = snapshot
-                    self._history[snapshot.symbol].append(snapshot)
-                    if self._updates.full():
-                        with contextlib.suppress(asyncio.QueueEmpty):
-                            self._updates.get_nowait()
-                        self._dropped_updates += 1
-                    self._updates.put_nowait(snapshot)
-                    # A valid book confirms that a reconnect actually recovered.
-                    self._error = None
-                    self._updated.set()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if not self._stopping:
-                    self._error = f"{type(exc).__name__}: {exc}"
-                    self._reconnects += 1
-                    self._updated.set()
-                    await asyncio.sleep(delay_seconds)
-                    delay_seconds = min(delay_seconds * 2, 10.0)
-            finally:
-                if websocket is not None:
-                    with contextlib.suppress(Exception):
-                        await websocket.close()
-                if self._websocket is websocket:
-                    self._websocket = None
+        websocket: Any = None
+        try:
+            websocket = await self.connect_websocket(
+                self.endpoint,
+                open_timeout=self.timeout_seconds,
+                close_timeout=1,
+                ping_interval=20,
+                ping_timeout=20,
+                proxy=self.proxy_url,
+            )
+            self._websocket = websocket
+            await websocket.send(
+                json.dumps({"method": "SUBSCRIPTION", "params": channels}, separators=(",", ":")),
+            )
+            while not self._stopping:
+                raw = await websocket.recv()
+                if raw is None:
+                    raise ConnectionError("websocket closed by peer")
+                if not isinstance(raw, bytes):
+                    continue
+                received_realtime_ns = time.time_ns()
+                received_monotonic_ns = time.monotonic_ns()
+                try:
+                    snapshot = parse_mexc_partial_depth_message(
+                        raw,
+                        received_realtime_ns=received_realtime_ns,
+                        received_monotonic_ns=received_monotonic_ns,
+                    )
+                except (InvalidOperation, ValueError):
+                    continue
+                if snapshot.symbol not in self.symbols:
+                    continue
+                self._latest[snapshot.symbol] = snapshot
+                self._history[snapshot.symbol].append(snapshot)
+                if self._updates.full():
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        self._updates.get_nowait()
+                    self._dropped_updates += 1
+                self._updates.put_nowait(snapshot)
+                self._error = None
+                self._updated.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._error = f"{type(exc).__name__}: {exc}"
+            self._updated.set()
+            raise
+        finally:
+            if websocket is not None:
+                with contextlib.suppress(Exception):
+                    await websocket.close()
+            if self._websocket is websocket:
+                self._websocket = None
 
     def snapshot_batch(
         self,
@@ -962,8 +987,21 @@ class MexcPartialDepthStream:
 
     async def next_update(self) -> BookSnapshot:
         """Wait for the next locally received partial-depth snapshot."""
-
-        return await self._updates.get()
+        if not self._updates.empty():
+            return self._updates.get_nowait()
+        self._raise_receiver_failure()
+        assert self._receiver is not None
+        update = asyncio.create_task(self._updates.get())
+        done, _ = await asyncio.wait(
+            (update, self._receiver),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if update in done:
+            return update.result()
+        update.cancel()
+        await asyncio.gather(update, return_exceptions=True)
+        self._raise_receiver_failure()
+        raise RuntimeError("MEXC websocket receiver exited unexpectedly")
 
     @property
     def dropped_updates(self) -> int:
@@ -993,7 +1031,7 @@ class MexcPartialDepthStream:
         self._stopping = True
         if self._receiver is not None:
             self._receiver.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._receiver
             self._receiver = None
         if self._websocket is not None:
@@ -1554,6 +1592,12 @@ def build_cycle_providers(
     stonfi_slippage_tolerance: Decimal,
     raydium_min_request_interval_seconds: float = 0.6,
     raydium_request_pacer: AsyncRequestPacer | None = None,
+    evm_request_pacer: AsyncRequestPacer | Mapping[str, AsyncRequestPacer] | None = None,
+    stonfi_request_pacer: AsyncRequestPacer | None = None,
+    omniston_request_pacer: AsyncRequestPacer | None = None,
+    evm_min_request_interval_seconds: float = 0.6,
+    stonfi_min_request_interval_seconds: float = 0.6,
+    omniston_min_request_interval_seconds: float = 0.6,
     jupiter_api_key: str | None = None,
     jupiter_min_request_interval_seconds: float | None = None,
     jupiter_request_pacer: AsyncRequestPacer | None = None,
@@ -1580,12 +1624,31 @@ def build_cycle_providers(
     raydium_pacer = raydium_request_pacer or AsyncRequestPacer(
         raydium_min_request_interval_seconds,
     )
+
+    if evm_request_pacer is None:
+        evm_request_pacer = {
+            "base": AsyncRequestPacer(evm_min_request_interval_seconds),
+            "polygon": AsyncRequestPacer(evm_min_request_interval_seconds),
+        }
+    stonfi_request_pacer = stonfi_request_pacer or AsyncRequestPacer(
+        stonfi_min_request_interval_seconds,
+    )
+    omniston_request_pacer = omniston_request_pacer or AsyncRequestPacer(
+        omniston_min_request_interval_seconds,
+    )
+
+    def evm_pacer_for(market_name: str) -> AsyncRequestPacer | None:
+        if isinstance(evm_request_pacer, Mapping):
+            return evm_request_pacer.get(configured[market_name].chain)
+        return evm_request_pacer
+
     for name in sorted(requested):
         if name in configured:
             providers[name] = UniswapV3Provider(
                 configured[name],
                 proxy_url=proxy_url,
                 timeout_seconds=timeout_seconds,
+                request_pacer=evm_pacer_for(name),
                 fetch_json=fetch_json,
             )
         elif name in SOLANA_PROVIDER_BASES:
@@ -1640,6 +1703,7 @@ def build_cycle_providers(
                 proxy_url=proxy_url,
                 timeout_seconds=timeout_seconds,
                 slippage_tolerance=stonfi_slippage_tolerance,
+                request_pacer=stonfi_request_pacer,
                 fetch_json=fetch_json,
             )
         elif name in OMNISTON_PROVIDER_BASES:
@@ -1654,6 +1718,7 @@ def build_cycle_providers(
                 max_routes=omniston_max_routes,
                 allow_risky_routes=omniston_allow_risky_routes,
                 endpoint=omniston_ws_url,
+                request_pacer=omniston_request_pacer,
             )
         else:
             raise ValueError(f"unsupported provider: {name}")

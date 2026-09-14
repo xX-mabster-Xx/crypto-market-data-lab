@@ -1,6 +1,7 @@
 /** Read-only local exact-input Meteora DLMM quote engine. */
 
 import { createRequire } from "node:module";
+import { performance } from "node:perf_hooks";
 
 import BN from "bn.js";
 import type { BinArrayAccount, SwapQuote } from "@meteora-ag/dlmm";
@@ -12,9 +13,18 @@ import {
 } from "@solana/web3.js";
 
 import type { ConfigureMessage, PoolDescriptor, QuoteRequestMessage } from "./protocol.js";
-import { sharedRpcFetchMiddleware } from "./rpcPacer.js";
+import {
+  coreRefreshDue,
+  DebouncedStateEmitter,
+  PoolSlotProvenance,
+  type RunRpcJob,
+} from "./engineRuntime.js";
+import { scheduleRpc, sharedRpcFetch } from "./rpcPacer.js";
 
 const DEFAULT_BIN_CACHE_MAX_AGE_MS = 300_000;
+const DEFAULT_POOL_STATE_EMIT_MIN_INTERVAL_MS = 100;
+const DEFAULT_CORE_REFRESH_AFTER_MS = 15_000;
+const DEFAULT_REFRESH_STAGGER_WINDOW_MS = 5_000;
 
 export interface MeteoraPoolStateNotice {
   pool_id: string;
@@ -27,6 +37,10 @@ export interface MeteoraPoolStateNotice {
   token_b_decimals: number;
   bin_step: number;
   bin_cache_age_ms: number | null;
+  core_state_slot: number;
+  dependency_slot_min: number | null;
+  dependency_slot_max: number | null;
+  dependency_generation: number;
 }
 
 export interface MeteoraQuoteResult {
@@ -35,6 +49,10 @@ export interface MeteoraQuoteResult {
   label: string;
   status: "ok" | "stale_state" | "quote_unavailable";
   state_slot: number;
+  core_state_slot: number;
+  dependency_slot_min: number | null;
+  dependency_slot_max: number | null;
+  dependency_generation: number;
   input_mint: string;
   output_mint: string;
   input_amount_raw: string;
@@ -57,13 +75,14 @@ interface AttachedPool {
   descriptor: PoolDescriptor;
   address: PublicKey;
   dlmm: DlmmClient;
-  slot: number;
-  receivedAtMs: number;
+  provenance: PoolSlotProvenance;
+  coreAccountData: Buffer;
   poolSubscriptionId: number;
   binArrays: Map<string, BinArrayAccount>;
   binSubscriptionIds: Map<string, number>;
   binCacheAtMs: number;
   binRefresh?: Promise<void>;
+  stateEmitter: DebouncedStateEmitter;
 }
 
 interface DlmmClient {
@@ -108,16 +127,36 @@ export class MeteoraDlmmQuoteEngine {
   private connection: Connection | null = null;
   private pools = new Map<string, AttachedPool>();
   private binCacheMaxAgeMs = DEFAULT_BIN_CACHE_MAX_AGE_MS;
+  private poolStateEmitMinIntervalMs = DEFAULT_POOL_STATE_EMIT_MIN_INTERVAL_MS;
+  private coreRefreshAfterMs = DEFAULT_CORE_REFRESH_AFTER_MS;
+  private refreshStaggerWindowMs = DEFAULT_REFRESH_STAGGER_WINDOW_MS;
+  private closed = false;
+  private refreshesStarted = 0;
+  private refreshesCompleted = 0;
+  private refreshesUnchanged = 0;
 
-  public constructor(private readonly callbacks: MeteoraEngineCallbacks) {}
+  public constructor(
+    private readonly callbacks: MeteoraEngineCallbacks,
+    private readonly runRpcJob: RunRpcJob = scheduleRpc,
+  ) {}
 
   public async open(config: ConfigureMessage): Promise<void> {
     if (this.connection !== null) throw new Error("Meteora quote engine is already open");
+    this.closed = false;
     this.binCacheMaxAgeMs = config.tick_cache_max_age_ms ?? DEFAULT_BIN_CACHE_MAX_AGE_MS;
+    this.poolStateEmitMinIntervalMs = config.pool_state_emit_min_interval_ms
+      ?? DEFAULT_POOL_STATE_EMIT_MIN_INTERVAL_MS;
+    this.coreRefreshAfterMs = config.core_refresh_after_ms
+      ?? config.state_snapshot_refresh_interval_ms
+      ?? DEFAULT_CORE_REFRESH_AFTER_MS;
+    this.refreshStaggerWindowMs = Math.min(
+      config.refresh_stagger_window_ms ?? DEFAULT_REFRESH_STAGGER_WINDOW_MS,
+      this.coreRefreshAfterMs,
+    );
     this.connection = new Connection(config.rpc_http_url, {
       commitment: "processed",
       wsEndpoint: config.rpc_ws_url,
-      fetchMiddleware: sharedRpcFetchMiddleware,
+      fetch: sharedRpcFetch,
       confirmTransactionInitialTimeout: 10_000,
     });
     // Deliberately serial to stay below a free RPC's startup burst limit.
@@ -127,8 +166,10 @@ export class MeteoraDlmmQuoteEngine {
   }
 
   public async close(): Promise<void> {
+    this.closed = true;
     const connection = this.connection;
     if (connection !== null) {
+      for (const pool of this.pools.values()) pool.stateEmitter.dispose();
       const subscriptions = [...this.pools.values()].flatMap((pool) => [
         pool.poolSubscriptionId,
         ...pool.binSubscriptionIds.values(),
@@ -143,41 +184,35 @@ export class MeteoraDlmmQuoteEngine {
     this.connection = null;
   }
 
-  /** Reconcile LB-pair state in one batch; bin arrays stay demand-refreshed. */
+  /** Compatibility hook: maintenance is stale-driven and starts at most one refresh. */
   public async refreshAllPoolStates(): Promise<void> {
-    const connection = this.requireConnection();
-    const pools = [...this.pools.values()];
-    if (pools.length === 0) return;
-    const snapshot = await connection.getMultipleAccountsInfoAndContext(
-      pools.map((pool) => pool.address),
-      "processed",
-    );
-    for (let index = 0; index < pools.length; index += 1) {
-      const pool = pools[index];
-      const account = snapshot.value[index];
-      if (pool === undefined || account === null || account === undefined) {
-        throw new Error("Meteora refresh returned a missing LB-pair account");
-      }
-      if (snapshot.context.slot < pool.slot) continue;
-      pool.dlmm.lbPair = MeteoraSdk.decodeAccount(
-        pool.dlmm.program,
-        "lbPair",
-        account.data,
-      ) as DlmmClient["lbPair"];
-      pool.slot = snapshot.context.slot;
-      pool.receivedAtMs = Date.now();
-      this.emitPoolState(pool);
+    await this.maintainStalePools(performance.now());
+  }
+
+  public async maintainStalePools(nowMs = performance.now()): Promise<void> {
+    for (const pool of this.pools.values()) {
+      if (pool.provenance.refreshInFlight || !coreRefreshDue(
+        pool.provenance,
+        `meteora-dlmm:${pool.descriptor.pool_id}`,
+        nowMs,
+        this.coreRefreshAfterMs,
+        this.refreshStaggerWindowMs,
+      )) continue;
+      await this.scheduleCoreRefresh(pool);
+      return;
     }
   }
 
   public async quote(request: QuoteRequestMessage): Promise<MeteoraQuoteResult> {
     const pool = this.pools.get(request.pool_id);
     if (pool === undefined) return this.unavailable(request, "pool is not configured in this worker");
-    if (request.minimum_state_slot !== undefined && pool.slot < request.minimum_state_slot) {
+    if (request.minimum_state_slot !== undefined
+      && pool.provenance.coreStateSlot < request.minimum_state_slot) {
       return {
         ...this.unavailable(request, "worker state is older than required minimum slot"),
         status: "stale_state",
-        state_slot: pool.slot,
+        state_slot: pool.provenance.coreStateSlot,
+        ...pool.provenance.fields(),
       };
     }
     const tokenX = pool.dlmm.tokenX.mint.address.toBase58();
@@ -202,7 +237,8 @@ export class MeteoraDlmmQuoteEngine {
         pool_id: pool.descriptor.pool_id,
         label: pool.descriptor.label,
         status: "ok",
-        state_slot: pool.slot,
+        state_slot: pool.provenance.coreStateSlot,
+        ...pool.provenance.fields(),
         input_mint: request.input_mint,
         output_mint: request.output_mint,
         input_amount_raw: request.input_amount_raw,
@@ -232,16 +268,22 @@ export class MeteoraDlmmQuoteEngine {
       "lbPair",
       account.value.data,
     ) as DlmmClient["lbPair"];
-    const pool: AttachedPool = {
+    const provenance = new PoolSlotProvenance(account.context.slot);
+    let pool!: AttachedPool;
+    pool = {
       descriptor,
       address: publicKey,
       dlmm,
-      slot: account.context.slot,
-      receivedAtMs: Date.now(),
+      provenance,
+      coreAccountData: Buffer.from(account.value.data),
       poolSubscriptionId: -1,
       binArrays: new Map(),
       binSubscriptionIds: new Map(),
       binCacheAtMs: 0,
+      stateEmitter: new DebouncedStateEmitter(
+        () => this.emitPoolStateNow(pool),
+        this.poolStateEmitMinIntervalMs,
+      ),
     };
     pool.poolSubscriptionId = connection.onAccountChange(
       publicKey,
@@ -250,19 +292,19 @@ export class MeteoraDlmmQuoteEngine {
     );
     this.pools.set(descriptor.pool_id, pool);
     await this.ensureBinCache(pool, true);
-    this.emitPoolState(pool);
+    this.requestPoolState(pool, "initial", "immediate");
   }
 
   private updatePair(pool: AttachedPool, account: AccountInfo<Buffer>, context: Context): void {
-    if (context.slot < pool.slot) return;
+    if (context.slot <= pool.provenance.coreStateSlot) return;
     pool.dlmm.lbPair = MeteoraSdk.decodeAccount(
       pool.dlmm.program,
       "lbPair",
       account.data,
     ) as DlmmClient["lbPair"];
-    pool.slot = context.slot;
-    pool.receivedAtMs = Date.now();
-    this.emitPoolState(pool);
+    pool.coreAccountData = Buffer.from(account.data);
+    if (!pool.provenance.acceptCore(context.slot)) return;
+    this.requestPoolState(pool, `core:${context.slot}`, "immediate");
   }
 
   private updateBin(
@@ -271,14 +313,23 @@ export class MeteoraDlmmQuoteEngine {
     account: AccountInfo<Buffer>,
     context: Context,
   ): void {
+    const key = publicKey.toBase58();
+    const decoded = MeteoraSdk.decodeAccount(
+      pool.dlmm.program,
+      "binArray",
+      account.data,
+    ) as BinArrayAccount["account"];
+    if (!pool.provenance.acceptDependency(key, context.slot)) return;
     pool.binArrays.set(publicKey.toBase58(), {
       publicKey,
-      account: MeteoraSdk.decodeAccount(pool.dlmm.program, "binArray", account.data),
+      account: decoded,
     });
-    pool.slot = Math.max(pool.slot, context.slot);
-    pool.receivedAtMs = Date.now();
     pool.binCacheAtMs = Date.now();
-    this.emitPoolState(pool);
+    this.requestPoolState(
+      pool,
+      `dependency:${pool.provenance.dependencyGeneration}`,
+      "debounced",
+    );
   }
 
   private async ensureBinCache(pool: AttachedPool, force: boolean): Promise<void> {
@@ -296,6 +347,7 @@ export class MeteoraDlmmQuoteEngine {
 
   private async refreshBins(pool: AttachedPool): Promise<void> {
     const connection = this.requireConnection();
+    const hadCache = pool.binArrays.size > 0;
     const [forY, forX] = await Promise.all([
       pool.dlmm.getBinArrayForSwap(true, 4),
       pool.dlmm.getBinArrayForSwap(false, 4),
@@ -308,6 +360,7 @@ export class MeteoraDlmmQuoteEngine {
       if (!current.has(address)) {
         await connection.removeAccountChangeListener(subscriptionId);
         pool.binSubscriptionIds.delete(address);
+        pool.provenance.forgetDependency(address);
       }
     }
     for (const [address, item] of current) {
@@ -322,13 +375,74 @@ export class MeteoraDlmmQuoteEngine {
     }
     pool.binArrays = current;
     pool.binCacheAtMs = Date.now();
+    if (hadCache) {
+      pool.provenance.advanceDependencyGeneration();
+      this.requestPoolState(
+        pool,
+        `dependency:${pool.provenance.dependencyGeneration}`,
+        "debounced",
+      );
+    } else {
+      pool.provenance.noteDependencyRefresh();
+    }
   }
 
-  private emitPoolState(pool: AttachedPool): void {
+  private async scheduleCoreRefresh(pool: AttachedPool): Promise<void> {
+    if (this.closed || pool.provenance.refreshInFlight) return;
+    pool.provenance.refreshInFlight = true;
+    pool.provenance.refreshGeneration += 1;
+    this.refreshesStarted += 1;
+    try {
+      await this.runRpcJob(
+        {
+          priority: "refresh",
+          coalesceKey: `refresh:meteora:${pool.descriptor.pool_id}`,
+          description: `refresh Meteora DLMM core ${pool.descriptor.pool_id}`,
+        },
+        async () => this.refreshCore(pool),
+      );
+      this.refreshesCompleted += 1;
+    } finally {
+      pool.provenance.refreshInFlight = false;
+    }
+  }
+
+  private async refreshCore(pool: AttachedPool): Promise<void> {
+    const account = await this.requireConnection().getAccountInfoAndContext(pool.address, "processed");
+    if (account.value === null) throw new Error("Meteora refresh returned a missing LB-pair account");
+    if (account.context.slot < pool.provenance.coreStateSlot) return;
+    const changed = !pool.coreAccountData.equals(account.value.data);
+    pool.dlmm.lbPair = MeteoraSdk.decodeAccount(
+      pool.dlmm.program,
+      "lbPair",
+      account.value.data,
+    ) as DlmmClient["lbPair"];
+    pool.coreAccountData = Buffer.from(account.value.data);
+    if (account.context.slot > pool.provenance.coreStateSlot) {
+      pool.provenance.acceptCore(account.context.slot);
+    }
+    pool.provenance.noteRpcRefresh();
+    if (changed) {
+      this.requestPoolState(pool, `refresh:${account.context.slot}`, "immediate");
+    } else {
+      this.refreshesUnchanged += 1;
+    }
+  }
+
+  private requestPoolState(
+    pool: AttachedPool,
+    fingerprint: string,
+    mode: "immediate" | "debounced",
+  ): void {
+    pool.stateEmitter.request(fingerprint, mode);
+  }
+
+  private emitPoolStateNow(pool: AttachedPool): void {
+    if (this.closed) return;
     this.callbacks.onPoolState({
       pool_id: pool.descriptor.pool_id,
       label: pool.descriptor.label,
-      slot: pool.slot,
+      slot: pool.provenance.coreStateSlot,
       active_id: pool.dlmm.lbPair.activeId,
       token_a_mint: pool.dlmm.tokenX.mint.address.toBase58(),
       token_b_mint: pool.dlmm.tokenY.mint.address.toBase58(),
@@ -336,7 +450,29 @@ export class MeteoraDlmmQuoteEngine {
       token_b_decimals: pool.dlmm.tokenY.mint.decimals,
       bin_step: pool.dlmm.lbPair.binStep,
       bin_cache_age_ms: pool.binCacheAtMs === 0 ? null : Math.max(0, Date.now() - pool.binCacheAtMs),
+      ...pool.provenance.fields(),
     });
+  }
+
+  public runtimeStats(): Record<string, number> {
+    let dependencyEmitsCoalesced = 0;
+    let externalEmits = 0;
+    let refreshInFlight = 0;
+    for (const pool of this.pools.values()) {
+      const emitter = pool.stateEmitter.stats();
+      dependencyEmitsCoalesced += emitter.coalesced_total;
+      externalEmits += emitter.external_emits_total;
+      refreshInFlight += pool.provenance.refreshInFlight ? 1 : 0;
+    }
+    return {
+      pool_count: this.pools.size,
+      dependency_emits_coalesced_total: dependencyEmitsCoalesced,
+      external_pool_state_emits_total: externalEmits,
+      refresh_inflight: refreshInFlight,
+      refreshes_started_total: this.refreshesStarted,
+      refreshes_completed_total: this.refreshesCompleted,
+      refreshes_unchanged_total: this.refreshesUnchanged,
+    };
   }
 
   private unavailable(request: QuoteRequestMessage, error: string): MeteoraQuoteResult {
@@ -346,7 +482,15 @@ export class MeteoraDlmmQuoteEngine {
       pool_id: request.pool_id,
       label: pool?.descriptor.label ?? request.pool_id,
       status: "quote_unavailable",
-      state_slot: pool?.slot ?? 0,
+      state_slot: pool?.provenance.coreStateSlot ?? 0,
+      ...(pool === undefined
+        ? {
+          core_state_slot: 0,
+          dependency_slot_min: null,
+          dependency_slot_max: null,
+          dependency_generation: 0,
+        }
+        : pool.provenance.fields()),
       input_mint: request.input_mint,
       output_mint: request.output_mint,
       input_amount_raw: request.input_amount_raw,

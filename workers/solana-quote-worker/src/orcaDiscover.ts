@@ -6,6 +6,8 @@ import readline from "node:readline";
 import { Connection, PublicKey, type AccountInfo } from "@solana/web3.js";
 import type { WhirlpoolData } from "@orca-so/whirlpools-sdk";
 
+import { closeProtocolOutput, emit } from "./protocol.js";
+
 interface AssetInput {
   symbol: string;
   mint: string;
@@ -181,11 +183,13 @@ try {
   for await (const line of lines) {
     if (line.trim().length === 0) continue;
     const result = await discover(parseInput(JSON.parse(line)));
-    process.stdout.write(`${JSON.stringify(result)}\n`);
+    emit(result);
+    await closeProtocolOutput();
     break;
   }
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
-  process.stdout.write(`${JSON.stringify({ type: "orca_discovery_error", error: message.slice(0, 512) })}\n`);
+  emit({ type: "orca_discovery_error", error: message.slice(0, 512) });
+  await closeProtocolOutput().catch(() => undefined);
   process.exitCode = 1;
 }

@@ -10,6 +10,7 @@ from market_data_lab.cex_dex_cycles import MARKETS
 from market_data_lab.cex_dex_cycles import MexcPartialDepthStream
 from market_data_lab.cex_dex_cycles import _best_dex_records
 from market_data_lab.cex_dex_cycles import build_cycle_providers
+from market_data_lab.dex_quotes import AsyncRequestPacer
 from market_data_lab.cex_dex_cycles import calculate_cycle
 from market_data_lab.cex_dex_cycles import choose_nearest_book
 from market_data_lab.cex_dex_cycles import market_for_cex
@@ -255,7 +256,7 @@ class BybitBookTest(unittest.TestCase):
 
 
 class MexcStreamReconnectTest(unittest.IsolatedAsyncioTestCase):
-    async def test_reconnects_after_terminal_receive_error(self) -> None:
+    async def test_terminal_receive_error_is_owned_by_outer_supervisor(self) -> None:
         first = _FakeMexcWebsocket([ConnectionError("transient receive failure")])
         second = _FakeMexcWebsocket([_mexc_partial_depth_message()])
         sockets = iter((first, second))
@@ -271,13 +272,12 @@ class MexcStreamReconnectTest(unittest.IsolatedAsyncioTestCase):
             connect_websocket=connect,
         )
         try:
-            await stream.start()
-            snapshot = await asyncio.wait_for(stream.next_update(), timeout=0.1)
-            self.assertEqual(snapshot.symbol, "TESTUSDT")
-            self.assertEqual(stream.reconnects, 1)
-            self.assertIsNone(stream.error)
+            with self.assertRaisesRegex(RuntimeError, "transport failed"):
+                await stream.start()
+            self.assertEqual(stream.reconnects, 0)
+            self.assertIn("transient receive failure", stream.error or "")
             self.assertTrue(first.sent)
-            self.assertTrue(second.sent)
+            self.assertFalse(second.sent)
         finally:
             await stream.close()
 
@@ -512,6 +512,29 @@ class CycleCalculationTest(unittest.TestCase):
 
 
 class LongTailRegistryTest(unittest.TestCase):
+    def test_non_solana_providers_receive_request_level_pacers(self) -> None:
+        evm_pacer = AsyncRequestPacer(0.25)
+        stonfi_pacer = AsyncRequestPacer(0.5)
+        omniston_pacer = AsyncRequestPacer(0.75)
+        providers = build_cycle_providers(
+            ["ETH_BASE_UNISWAP", "NOT_TON_STONFI", "DOGS_TON_OMNISTON"],
+            base_rpc_url="https://base.example",
+            polygon_rpc_url="https://polygon.example",
+            fee_tiers=[500],
+            proxy_url=None,
+            timeout_seconds=1,
+            raydium_slippage_bps=50,
+            stonfi_slippage_tolerance=Decimal("0.005"),
+            evm_request_pacer=evm_pacer,
+            stonfi_request_pacer=stonfi_pacer,
+            omniston_request_pacer=omniston_pacer,
+            fetch_json=lambda *args: {},
+        )
+
+        self.assertIs(providers["UNISWAP_BASE"].request_pacer, evm_pacer)
+        self.assertIs(providers["STONFI_NOT"].request_pacer, stonfi_pacer)
+        self.assertIs(providers["OMNISTON_DOGS"].request_pacer, omniston_pacer)
+
     def test_solana_and_ton_markets_build_canonical_asset_providers(self) -> None:
         providers = build_cycle_providers(
             ["MEW_SOLANA_RAYDIUM", "NOT_TON_STONFI"],

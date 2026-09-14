@@ -650,11 +650,13 @@ class QuoteBroker:
     async def _execute(self, request: QuoteRequest) -> QuoteResult:
         backend = self._backends.get(request.key.provider)
         if backend is None:
-            return self._failure(request, "unsupported", "quote_provider_backend_unavailable")
+            result = self._failure(request, "unsupported", "quote_provider_backend_unavailable")
+            self.observe_result(result)
+            return result
         try:
             result = await backend(request)
             if result.key != request.key:
-                return self._failure(request, "provider_error", "quote_backend_key_mismatch")
+                result = self._failure(request, "provider_error", "quote_backend_key_mismatch")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -739,8 +741,13 @@ class QuoteBroker:
 
         existing = self._inflight.get(request.key)
         if existing is not None:
-            self._counts["inflight_joins"] += 1
-            return await self._deliver(existing, request, served_from="inflight_shared")
+            if not existing.done():
+                self._counts["inflight_joins"] += 1
+                return await self._deliver(existing, request, served_from="inflight_shared")
+            # asyncio schedules done callbacks separately from task
+            # completion. Remove a terminal task before an immediate retry so
+            # a failure is accounted by the gate instead of replayed.
+            self._remove_inflight(request.key, existing)
 
         if request.key.provider not in self._backends:
             self._counts["unsupported"] += 1
@@ -978,8 +985,18 @@ class QuoteBroker:
             )
         existing = self._local_inflight.get(request.key)
         if existing is not None:
-            self._counts["simulation_inflight_joins"] += 1
-            return await self._deliver(existing, request, served_from="local_inflight_shared")
+            if not existing.done():
+                self._counts["simulation_inflight_joins"] += 1
+                return await self._deliver(existing, request, served_from="local_inflight_shared")
+            self._remove_local_inflight(request.key, existing)
+        failure_gate = self._blocked_by_failure(request.key, now_ns=now_ns)
+        if failure_gate is not None:
+            self._counts[f"simulation_blocked_{failure_gate.status}"] += 1
+            return self._failure(
+                request,
+                failure_gate.status,
+                failure_gate.reason,
+            )
         backend = self._local_backends.get(request.key.provider)
         if backend is None:
             self._counts["simulation_unsupported"] += 1
@@ -996,7 +1013,7 @@ class QuoteBroker:
         try:
             result = await backend(request)
             if result.key != request.key:
-                return self._failure(request, "provider_error", "local_backend_key_mismatch")
+                result = self._failure(request, "provider_error", "local_backend_key_mismatch")
         except asyncio.CancelledError:
             raise
         except Exception as exc:

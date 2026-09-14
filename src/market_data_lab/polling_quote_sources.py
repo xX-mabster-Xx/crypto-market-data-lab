@@ -141,6 +141,17 @@ def _static_slot_id(amount: Decimal) -> str:
     return f"notional:{canonical_decimal_text(amount)}"
 
 
+def _validated_slot_id(value: object) -> str | None:
+    """Return a bounded, non-empty logical slot id or ``None``."""
+
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate or len(candidate) > 128 or any(char.isspace() for char in candidate):
+        return None
+    return candidate
+
+
 def _slot_id_from_record(record: Mapping[str, Any], source_name: str) -> str | None:
     """Extract or derive a stable quote_slot_id from a provider record.
 
@@ -151,16 +162,16 @@ def _slot_id_from_record(record: Mapping[str, Any], source_name: str) -> str | N
     unmapped rather than generating a new arbitrary key per payload.
     """
 
-    explicit = record.get("quote_slot_id")
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()[:128]
+    reference = _as_decimal(record.get("reference_notional_usdt"))
+    if reference is not None and reference > 0:
+        return f"triangle-reference-usdt:{canonical_decimal_text(reference)}"
+    explicit = _validated_slot_id(record.get("quote_slot_id"))
+    if explicit is not None:
+        return explicit
     notional = _as_decimal(record.get("requested_notional_quote"))
-    direction = record.get("direction")
     if notional is None or not notional.is_finite() or notional <= 0:
         return None
-    if not isinstance(direction, str) or direction not in {"buy_base", "sell_base"}:
-        return None
-    return f"notional:{canonical_decimal_text(notional)}:{direction}"
+    return f"notional:{canonical_decimal_text(notional)}"
 
 
 @dataclass
@@ -273,7 +284,7 @@ class PollingDexQuoteSource:
             "source": self.name,
             "provider": str(self.provider.name),
             "mode": "public_exact_input_quote_polling",
-            "notionals_quote": [format(value, "f") for value in self.notionals],
+            "notionals_quote": [canonical_decimal_text(value) for value in self.notionals],
             "dynamic_notional_supplier": self.notional_supplier is not None,
             "minimum_round_interval_seconds": self.minimum_round_interval_seconds,
             "uses_shared_quota_pacer": self.shared_quota_pacer is not None,
@@ -310,9 +321,9 @@ class PollingDexQuoteSource:
             "last_quote_age_ms": round(age_ms, 3) if age_ms is not None else None,
             "last_round_inputs": [
                 {
-                    "amount": format(item.amount, "f"),
+                    "amount": canonical_decimal_text(item.amount),
                     "reference_notional_usdt": (
-                        format(item.reference_notional_usdt, "f")
+                        canonical_decimal_text(item.reference_notional_usdt)
                         if item.reference_notional_usdt is not None
                         else None
                      ),
@@ -531,24 +542,24 @@ class PollingDexQuoteSource:
             "direction": quote.direction,
             "round_id": quote.round_id,
             "requested_notional_quote": (
-                format(quote.requested_notional_quote, "f")
+                canonical_decimal_text(quote.requested_notional_quote)
                 if quote.requested_notional_quote is not None
                 else None
             ),
             "reference_notional_usdt": (
-                format(quote.reference_notional_usdt, "f")
+                canonical_decimal_text(quote.reference_notional_usdt)
                 if quote.reference_notional_usdt is not None
                 else None
             ),
-            "base_amount": format(quote.base_amount, "f") if quote.base_amount is not None else None,
-            "quote_amount": format(quote.quote_amount, "f") if quote.quote_amount is not None else None,
+            "base_amount": canonical_decimal_text(quote.base_amount) if quote.base_amount is not None else None,
+            "quote_amount": canonical_decimal_text(quote.quote_amount) if quote.quote_amount is not None else None,
             "status": quote.status,
             "average_price_quote_per_base": (
-                format(quote.average_price_quote_per_base, "f")
+                canonical_decimal_text(quote.average_price_quote_per_base)
                 if quote.average_price_quote_per_base is not None
                 else None
             ),
-            "fee_bps": format(quote.fee_bps, "f") if quote.fee_bps is not None else None,
+            "fee_bps": canonical_decimal_text(quote.fee_bps) if quote.fee_bps is not None else None,
             "request_rtt_ms": quote.request_rtt_ms,
             "block_number": quote.block_number,
             "error": quote.error,
@@ -557,6 +568,18 @@ class PollingDexQuoteSource:
 
     async def _publish_record(self, publish: Publish, record: Mapping[str, Any]) -> None:
         quote = self._normalise(record)
+        # A provider response may carry an arbitrary diagnostic direction or
+        # slot field.  Once a round has been formed, only the slots requested
+        # for that round are eligible for strategy state; everything else is
+        # a single stable diagnostic stream.
+        if self._last_round_inputs:
+            allowed_slots = {
+                item.quote_slot_id
+                for item in self._last_round_inputs
+                if item.quote_slot_id is not None
+            }
+            if quote.quote_slot_id not in allowed_slots:
+                quote = replace(quote, quote_slot_id=None)
         self._observations += 1
         self._statuses[quote.status] += 1
         self._last_event_monotonic_ns = quote.response_received_monotonic_ns
@@ -567,7 +590,7 @@ class PollingDexQuoteSource:
         elif quote.status == "ok":
             self._last_error = None
         slot_id = quote.quote_slot_id or "unmapped"
-        direction = quote.direction or "unknown"
+        direction = quote.direction if quote.direction in {"buy_base", "sell_base"} else "unknown"
         await publish(
             MarketEvent(
                 source=self.name,
@@ -606,7 +629,7 @@ class PollingDexQuoteSource:
                 )
             ):
                 continue
-            slot_id = item.quote_slot_id
+            slot_id = _validated_slot_id(item.quote_slot_id)
             if not slot_id:
                 if item.reference_notional_usdt is not None:
                     slot_id = f"triangle-reference-usdt:{canonical_decimal_text(item.reference_notional_usdt)}"
@@ -625,11 +648,16 @@ class PollingDexQuoteSource:
         *,
         reference_by_notional: Mapping[str, Decimal],
     ) -> Mapping[str, Any]:
-        reference = reference_by_notional.get(str(record.get("requested_notional_quote")))
+        requested = _as_decimal(record.get("requested_notional_quote"))
+        reference = (
+            reference_by_notional.get(canonical_decimal_text(requested))
+            if requested is not None
+            else None
+        )
         if reference is None:
             return record
         payload = dict(record)
-        payload["reference_notional_usdt"] = format(reference, "f")
+        payload["reference_notional_usdt"] = canonical_decimal_text(reference)
         payload["quote_slot_id"] = (
             f"triangle-reference-usdt:{canonical_decimal_text(reference)}"
         )
@@ -684,7 +712,7 @@ class PollingDexQuoteSource:
                 continue
             notionals = tuple(item.amount for item in round_inputs)
             reference_by_notional = {
-                format(item.amount, "f"): item.reference_notional_usdt
+                canonical_decimal_text(item.amount): item.reference_notional_usdt
                 for item in round_inputs
                 if item.reference_notional_usdt is not None
             }

@@ -5,6 +5,7 @@
 [scanner]
 retention_seconds = 180
 max_events_per_key = 4096
+max_state_keys = 65536
 event_bus_capacity = 8192
 status_flush_seconds = 2
 
@@ -22,6 +23,10 @@ minimum_request_interval_seconds = 2.05
 enabled = false
 tick_cache_max_age_ms = 300000
 state_snapshot_refresh_interval_ms = 15000
+core_refresh_after_ms = 15000
+maintenance_scan_interval_ms = 1000
+refresh_stagger_window_ms = 5000
+pool_state_emit_min_interval_ms = 100
 rpc_http_min_request_interval_ms = 200
 
 [[solana.raydium_clmm_pool]]

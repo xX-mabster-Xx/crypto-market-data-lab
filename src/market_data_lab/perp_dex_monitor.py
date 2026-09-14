@@ -538,7 +538,9 @@ def calculate_perp_dex_basis(
             return {**common, "status": "stable_fx_unavailable", "timing_valid": False}
         response_skews_ns.append(abs(stable_book.response.received_realtime_ns - dex_received_ns))
     response_skew_ms = Decimal(max(response_skews_ns)) / Decimal(1_000_000)
-    ticker_age_ms = Decimal(max(0, time.time_ns() - ticker.received_realtime_ns)) / Decimal(1_000_000)
+    ticker_age_ms = Decimal(
+        max(0, time.monotonic_ns() - ticker.received_monotonic_ns)
+    ) / Decimal(1_000_000)
     timing_valid = response_skew_ms <= max_response_skew_ms
     if ticker_age_ms > max_ticker_age_ms:
         return {
@@ -1221,10 +1223,12 @@ async def record_perp_dex_monitor(
         gate_key = _provider_gate_key(market)
         gate = quote_gates.get(gate_key) if gate_key else None
         exact_base_quote = getattr(provider, "quote_exact_base_round", None)
+        request_pacer = getattr(provider, "request_pacer", None)
+        pacing = None if isinstance(request_pacer, AsyncRequestPacer) else gate
         round_id = 0
         while not stop_event.is_set():
-            if gate is not None:
-                await gate.wait()
+            if pacing is not None:
+                await pacing.wait()
             try:
                 if callable(exact_base_quote):
                     symbol = bybit_linear_symbol(market)
@@ -1299,7 +1303,7 @@ async def record_perp_dex_monitor(
             stats.last_perp_update_at = datetime.now(UTC).isoformat()
             for market in markets_by_symbol.get(book.symbol, ()):
                 for record in tuple(cache_by_market[market.name].values()):
-                    if time.time_ns() - int(record.get("response_received_realtime_ns", 0)) <= cache_age_ns:
+                    if time.monotonic_ns() - int(record.get("response_received_monotonic_ns", 0)) <= cache_age_ns:
                         evaluate(output, market=market, dex_record=record, changed_book=book)
 
     async def stable_update_worker(output: Any) -> None:
@@ -1323,7 +1327,7 @@ async def record_perp_dex_monitor(
                 if market.quote_symbol.upper() != "USDC":
                     continue
                 for record in tuple(cache_by_market[market.name].values()):
-                    if time.time_ns() - int(record.get("response_received_realtime_ns", 0)) <= cache_age_ns:
+                    if time.monotonic_ns() - int(record.get("response_received_monotonic_ns", 0)) <= cache_age_ns:
                         evaluate(output, market=market, dex_record=record)
 
     async def stats_writer() -> None:

@@ -105,19 +105,22 @@ class ShardedPublicBookStream:
         self._dropped_updates = 0
 
     async def start(self) -> None:
+        if self._forwarders:
+            raise RuntimeError("sharded stream is already started")
+        self._active.clear()
+        while not self._updates.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._updates.get_nowait()
         starts = await asyncio.gather(*(shard.start() for shard in self.shards), return_exceptions=True)
-        self._active = [
-            shard
-            for shard, result in zip(self.shards, starts, strict=True)
-            if not isinstance(result, BaseException)
-        ]
-        if not self._active:
+        failures = [result for result in starts if isinstance(result, BaseException)]
+        if failures:
+            await asyncio.gather(*(shard.close() for shard in self.shards), return_exceptions=True)
             details = "; ".join(
                 f"{type(result).__name__}: {result}"
-                for result in starts
-                if isinstance(result, BaseException)
+                for result in failures
             )
-            raise RuntimeError(f"all public book shards failed to start: {details}"[:1024])
+            raise RuntimeError(f"public book shard failed to start: {details}"[:1024])
+        self._active = list(self.shards)
         self._forwarders = [asyncio.create_task(self._forward(shard)) for shard in self._active]
 
     async def _forward(self, shard: PublicBookStream) -> None:
@@ -129,20 +132,38 @@ class ShardedPublicBookStream:
                 self._dropped_updates += 1
             self._updates.put_nowait(update)
 
-    async def next_update(self) -> BookSnapshot:
-        # If the receiver task has exited (e.g. transport failure), propagate
-        # the error to the caller instead of blocking forever on the queue.
-        # This lets the outer supervisor own reconnection and epoch transitions.
-        if self._receiver is not None and self._receiver.done():
-            exc = self._receiver.exception()
+    def _raise_forwarder_failure(self) -> None:
+        for task in self._forwarders:
+            if not task.done():
+                continue
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                raise
             if exc is not None:
-                if isinstance(exc, asyncio.CancelledError):
-                    raise exc
-                raise RuntimeError(
-                    f"{self.venue} websocket transport failed: {exc}",
-                ) from exc
-            raise RuntimeError(f"{self.venue} websocket receiver exited unexpectedly")
-        return await self._updates.get()
+                raise RuntimeError(f"public book shard transport failed: {exc}") from exc
+            raise RuntimeError("public book shard forwarder exited unexpectedly")
+
+    async def next_update(self) -> BookSnapshot:
+        self._raise_forwarder_failure()
+        if not self._updates.empty():
+            return self._updates.get_nowait()
+        if not self._forwarders:
+            raise RuntimeError("sharded stream is not running")
+        update_task = asyncio.create_task(self._updates.get())
+        done, _ = await asyncio.wait(
+            (update_task, *self._forwarders),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if any(task.done() for task in self._forwarders):
+            update_task.cancel()
+            await asyncio.gather(update_task, return_exceptions=True)
+            self._raise_forwarder_failure()
+        if update_task in done:
+            return update_task.result()
+        update_task.cancel()
+        await asyncio.gather(update_task, return_exceptions=True)
+        raise RuntimeError("public book shard terminal state was not propagated")
 
     def nearest_snapshot(self, symbol: str, target_realtime_ns: int) -> BookSnapshot | None:
         shard = self._by_symbol.get(symbol.upper())
@@ -163,7 +184,7 @@ class ShardedPublicBookStream:
     @property
     def error(self) -> str | None:
         errors = [str(getattr(shard, "error", "")) for shard in self._active if getattr(shard, "error", None)]
-        return "; ".join(errors)[:1024] if self._active and len(errors) == len(self._active) else None
+        return "; ".join(errors)[:1024] if errors else None
 
     @property
     def reconnects(self) -> int:
@@ -329,13 +350,53 @@ class _EventedBookStream:
     async def start(self) -> None:
         if self._receiver is not None:
             raise RuntimeError("stream is already started")
+        self._stopping = False
+        self._error = None
+        self._latest.clear()
+        for history in self._history.values():
+            history.clear()
+        while not self._updates.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._updates.get_nowait()
+        self._first_update.clear()
+        self._reset_session_state()
         self._receiver = asyncio.create_task(self._supervise())
+        first_update = asyncio.create_task(self._first_update.wait())
         try:
-            await asyncio.wait_for(self._first_update.wait(), timeout=self.timeout_seconds)
+            done, _ = await asyncio.wait(
+                (first_update, self._receiver),
+                timeout=self.timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if first_update in done and first_update.result():
+                return
+            if self._receiver in done:
+                self._raise_receiver_failure()
+            raise TimeoutError("no valid public book update")
         except Exception:
             await self.close()
             detail = self._error or "no valid public book update"
             raise RuntimeError(f"{self.venue} websocket startup failed: {detail}") from None
+        finally:
+            first_update.cancel()
+            await asyncio.gather(first_update, return_exceptions=True)
+
+    def _reset_session_state(self) -> None:
+        """Clear venue-specific incremental reconstruction before a session."""
+
+    def _raise_receiver_failure(self) -> None:
+        receiver = self._receiver
+        if receiver is None:
+            raise RuntimeError(f"{self.venue} websocket stream is not running")
+        if not receiver.done():
+            return
+        try:
+            exc = receiver.exception()
+        except asyncio.CancelledError:
+            raise
+        if exc is not None:
+            raise RuntimeError(f"{self.venue} websocket transport failed: {exc}") from exc
+        raise RuntimeError(f"{self.venue} websocket receiver exited unexpectedly")
 
     async def _supervise(self) -> None:
         """Run a single WebSocket session, surfacing transport failures to the
@@ -428,7 +489,21 @@ class _EventedBookStream:
         return payload if isinstance(payload, dict) else None
 
     async def next_update(self) -> BookSnapshot:
-        return await self._updates.get()
+        if not self._updates.empty():
+            return self._updates.get_nowait()
+        self._raise_receiver_failure()
+        assert self._receiver is not None
+        update_task = asyncio.create_task(self._updates.get())
+        done, _ = await asyncio.wait(
+            (update_task, self._receiver),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if update_task in done:
+            return update_task.result()
+        update_task.cancel()
+        await asyncio.gather(update_task, return_exceptions=True)
+        self._raise_receiver_failure()
+        raise RuntimeError(f"{self.venue} websocket receiver exited unexpectedly")
 
     def nearest_snapshot(self, symbol: str, target_realtime_ns: int) -> BookSnapshot | None:
         history = self._history.get(symbol.upper())
@@ -443,7 +518,9 @@ class _EventedBookStream:
         snapshot = self._latest.get(symbol.upper())
         if snapshot is None:
             return None
-        age_ns = time.time_ns() - snapshot.response.received_realtime_ns
+        # Realtime timestamps are retained for correlation and persistence;
+        # elapsed freshness must use the monotonic receipt captured beside it.
+        age_ns = time.monotonic_ns() - snapshot.response.received_monotonic_ns
         if age_ns > int(max_age_ms * Decimal(1_000_000)):
             return replace(
                 snapshot,
@@ -497,6 +574,12 @@ class BybitOrderBookStream(_EventedBookStream):
         super().__init__(symbols, depth=50, **kwargs)
         self._bids: dict[str, dict[Decimal, Decimal]] = {symbol: {} for symbol in self.symbols}
         self._asks: dict[str, dict[Decimal, Decimal]] = {symbol: {} for symbol in self.symbols}
+        self._snapshot_ready: set[str] = set()
+
+    def _reset_session_state(self) -> None:
+        self._bids = {symbol: {} for symbol in self.symbols}
+        self._asks = {symbol: {} for symbol in self.symbols}
+        self._snapshot_ready.clear()
 
     async def _subscribe(self, websocket: Any) -> None:
         # Bybit spot accepts at most ten args per subscription request.
@@ -537,7 +620,10 @@ class BybitOrderBookStream(_EventedBookStream):
             if payload.get("type") == "snapshot":
                 self._bids[symbol] = dict(_level_tuple(bids, reverse=True, limit=50))
                 self._asks[symbol] = dict(_level_tuple(asks, reverse=False, limit=50))
+                self._snapshot_ready.add(symbol)
             elif payload.get("type") == "delta":
+                if symbol not in self._snapshot_ready:
+                    return
                 self._apply_delta(self._bids[symbol], bids)
                 self._apply_delta(self._asks[symbol], asks)
             else:
@@ -583,6 +669,11 @@ class BybitLinearOrderBookStream(BybitOrderBookStream):
         super().__init__(symbols, **kwargs)
         self._ticker_payloads: dict[str, dict[str, Any]] = {symbol: {} for symbol in self.symbols}
         self._tickers: dict[str, BybitLinearTicker] = {}
+
+    def _reset_session_state(self) -> None:
+        super()._reset_session_state()
+        self._ticker_payloads = {symbol: {} for symbol in self.symbols}
+        self._tickers.clear()
 
     async def _subscribe(self, websocket: Any) -> None:
         await super()._subscribe(websocket)

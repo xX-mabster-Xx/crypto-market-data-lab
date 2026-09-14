@@ -5,6 +5,7 @@ import json
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from market_data_lab.realtime_scanner import MarketEvent
 from market_data_lab.realtime_scanner import RollingStateStore
 from market_data_lab.solana_route_evaluator import LocalRouteEvaluatorConfig
 from market_data_lab.solana_route_evaluator import LocalSpotRoute
+from market_data_lab.solana_route_evaluator import CexDepthState
 from market_data_lab.solana_route_evaluator import SolanaRouteEvaluator
 
 
@@ -86,16 +88,37 @@ def _book(symbol: str, *, bids: list[tuple[str, str]], asks: list[tuple[str, str
 
 
 def _event(*, key: str, value: Any, summary: dict[str, Any], slot: int | None = None) -> MarketEvent:
+    realtime_ns = time.time_ns()
+    monotonic_ns = time.monotonic_ns()
     return MarketEvent(
         source="test:source",
         key=key,
         kind="test",
         value=value,
         summary=summary,
-        received_realtime_ns=time.time_ns(),
-        received_monotonic_ns=time.monotonic_ns(),
+        received_realtime_ns=realtime_ns,
+        received_monotonic_ns=monotonic_ns,
         chain_position=slot,
+        event_id=f"test:{key}:{monotonic_ns}",
     )
+
+
+class _FakeDepthProvider:
+    def __init__(self, pairs: tuple[tuple[MarketEvent, BookSnapshot], ...]) -> None:
+        self.depths = {
+            book.symbol: CexDepthState(
+                book=book,
+                source=event.source,
+                source_epoch=event.source_epoch,
+                event_id=event.event_id or "missing",
+                received_realtime_ns=event.received_realtime_ns,
+                received_monotonic_ns=event.received_monotonic_ns,
+            )
+            for event, book in pairs
+        }
+
+    def latest_depth(self, venue: str, symbol: str) -> CexDepthState | None:
+        return self.depths.get(symbol) if venue == "MEXC" else None
 
 
 class LocalRouteEvaluatorTest(unittest.IsolatedAsyncioTestCase):
@@ -138,14 +161,16 @@ class LocalRouteEvaluatorTest(unittest.IsolatedAsyncioTestCase):
             },
             slot=42,
         )
+        base_book = _book("BASEUSDT", bids=[("9.90", "100")], asks=[("10", "100")])
         base = _event(
             key=route.base_book_key,
-            value=_book("BASEUSDT", bids=[("9.90", "100")], asks=[("10", "100")]),
+            value={"compact_bbo_only": True},
             summary={},
         )
+        bridge_book = _book("BRIDGEUSDT", bids=[("100", "100")], asks=[("100", "100")])
         bridge = _event(
             key=route.bridge_book_key or "unexpected",
-            value=_book("BRIDGEUSDT", bids=[("100", "100")], asks=[("100", "100")]),
+            value={"compact_bbo_only": True},
             summary={},
         )
         for event in (pool, base, bridge):
@@ -161,6 +186,7 @@ class LocalRouteEvaluatorTest(unittest.IsolatedAsyncioTestCase):
                 store=store,
                 quote_source=source,
                 output_directory=output,
+                depth_provider=_FakeDepthProvider(((base, base_book), (bridge, bridge_book))),
                 gated_verifier=verifier,
             )
             runtime = evaluator._runtime[route.route_id]
@@ -217,18 +243,24 @@ class LocalRouteEvaluatorTest(unittest.IsolatedAsyncioTestCase):
             chain_position=1,
         )
         store.add(pool)
-        store.add(_event(key=route.base_book_key, value=_book("BASEUSDT", bids=[("9", "100")], asks=[("10", "100")]), summary={}))
-        store.add(_event(key=route.bridge_book_key or "unexpected", value=_book("BRIDGEUSDT", bids=[("99", "100")], asks=[("100", "100")]), summary={}))
+        base_book = _book("BASEUSDT", bids=[("9", "100")], asks=[("10", "100")])
+        base = _event(key=route.base_book_key, value={"compact_bbo_only": True}, summary={})
+        bridge_book = _book("BRIDGEUSDT", bids=[("99", "100")], asks=[("100", "100")])
+        bridge = _event(key=route.bridge_book_key or "unexpected", value={"compact_bbo_only": True}, summary={})
+        store.add(base)
+        store.add(bridge)
 
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "run"
             output.mkdir()
             source = _FakeQuoteSource()
+            depth_provider = _FakeDepthProvider(((base, base_book), (bridge, bridge_book)))
             evaluator = SolanaRouteEvaluator(
                 config=LocalRouteEvaluatorConfig(routes=(route,), maximum_pool_state_age_ms=100),
                 store=store,
                 quote_source=source,
                 output_directory=output,
+                depth_provider=depth_provider,
             )
             runtime = evaluator._runtime[route.route_id]
             await evaluator._evaluate_route(route, runtime)
@@ -253,14 +285,16 @@ class LocalRouteEvaluatorTest(unittest.IsolatedAsyncioTestCase):
             received_monotonic_ns=time.monotonic_ns() - 5_000_000_000,
             chain_position=1,
         )
+        base_book = _book("BASEUSDT", bids=[("9", "100")], asks=[("10", "100")])
         base = _event(
             key=route.base_book_key,
-            value=_book("BASEUSDT", bids=[("9", "100")], asks=[("10", "100")]),
+            value={"compact_bbo_only": True},
             summary={},
         )
+        bridge_book = _book("BRIDGEUSDT", bids=[("99", "100")], asks=[("100", "100")])
         bridge = _event(
             key=route.bridge_book_key or "unexpected",
-            value=_book("BRIDGEUSDT", bids=[("99", "100")], asks=[("100", "100")]),
+            value={"compact_bbo_only": True},
             summary={},
         )
         for event in (pool, base, bridge):
@@ -270,6 +304,7 @@ class LocalRouteEvaluatorTest(unittest.IsolatedAsyncioTestCase):
             output = Path(temporary) / "run"
             output.mkdir()
             source = _FakeQuoteSource()
+            depth_provider = _FakeDepthProvider(((base, base_book), (bridge, bridge_book)))
             evaluator = SolanaRouteEvaluator(
                 config=LocalRouteEvaluatorConfig(
                     routes=(route,),
@@ -279,6 +314,7 @@ class LocalRouteEvaluatorTest(unittest.IsolatedAsyncioTestCase):
                 store=store,
                 quote_source=source,
                 output_directory=output,
+                depth_provider=depth_provider,
             )
             runtime = evaluator._runtime[route.route_id]
             await evaluator._evaluate_route(route, runtime)
@@ -286,15 +322,18 @@ class LocalRouteEvaluatorTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(source.requests), 2)
             self.assertEqual(runtime.timing_valid_evaluations, 2)
 
-            skewed_bridge = MarketEvent(
-                source=bridge.source,
-                key=bridge.key,
-                kind=bridge.kind,
-                value=bridge.value,
-                summary=bridge.summary,
+            skewed_bridge = replace(
+                bridge,
                 received_realtime_ns=base.received_realtime_ns - 500_000_000,
                 received_monotonic_ns=time.monotonic_ns(),
-                chain_position=bridge.chain_position,
+            )
+            depth_provider.depths[bridge_book.symbol] = CexDepthState(
+                book=bridge_book,
+                source=skewed_bridge.source,
+                source_epoch=skewed_bridge.source_epoch,
+                event_id=skewed_bridge.event_id or "missing",
+                received_realtime_ns=skewed_bridge.received_realtime_ns,
+                received_monotonic_ns=skewed_bridge.received_monotonic_ns,
             )
             self.assertEqual(
                 evaluator._validate_freshness(route, pool, base, skewed_bridge),

@@ -30,7 +30,7 @@ import json
 import re
 import time
 from collections import Counter, defaultdict, deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -54,6 +54,7 @@ from market_data_lab.numeric_text import canonical_decimal_text
 from market_data_lab.polling_quote_sources import ExactInputQuote
 from market_data_lab.quantity_lattice import round_down_to_common_quantity_lattice
 from market_data_lab.realtime_scanner import MarketEvent
+from market_data_lab.realtime_scanner import SourceEpochChange
 from market_data_lab.rolling_cycle_monitor import DEFAULT_CEX_TAKER_FEES
 from market_data_lab.solana_realtime_scanner import CexTopOfBookEvent
 from market_data_lab.strategy_quality import derive_candidate_quality
@@ -152,6 +153,7 @@ class _PerpLeg:
     contract_model: PerpContractModel
     execution_model: str | None
     source: str
+    source_epoch: int
 
     @property
     def key(self) -> tuple[str, str]:
@@ -183,6 +185,8 @@ class _SpotLeg:
     best_ask_size: Decimal | None
     received_realtime_ns: int
     received_monotonic_ns: int
+    source: str
+    source_epoch: int
 
     @property
     def key(self) -> tuple[str, str]:
@@ -240,6 +244,8 @@ class UnifiedPerpAnalyzer:
         max_exact_quote_pair_cache_buckets: int = 2_048,
         max_exact_quote_pair_cache_records_per_bucket: int = 4,
         sequential_amm_simulator: Any = None,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        realtime_ns: Callable[[], int] = time.time_ns,
     ) -> None:
         if not _positive_decimal(max_response_skew_ms):
             raise ValueError("max_response_skew_ms must be finite and positive")
@@ -278,6 +284,8 @@ class UnifiedPerpAnalyzer:
         self.candidate_min_persistence_ms = candidate_min_persistence_ms
         self._candidate_min_persistence_ns = int(candidate_min_persistence_ms * Decimal(1_000_000))
         self.max_candidate_events = max_candidate_events
+        self._monotonic_ns = monotonic_ns
+        self._realtime_ns = realtime_ns
         self._sequential_amm_simulator = sequential_amm_simulator
         self._sequential_evidence: dict[str, SequentialUnwindResult] = {}
         self._sequential_evidence_paths: dict[str, str] = {}
@@ -289,14 +297,18 @@ class UnifiedPerpAnalyzer:
         self._spot_keys_by_base: dict[str, set[tuple[str, str]]] = defaultdict(set)
         self._direct_markets = {market.provider: market for market in MARKETS.values()}
         self._dex_quotes: dict[tuple[str, str, str], ExactInputQuote] = {}
+        self._dex_quote_provenance: dict[tuple[str, str, str], tuple[str, int]] = {}
+        self._current_source_epochs: dict[str, int] = {}
         self._dex_keys_by_base: dict[str, set[tuple[str, str, str]]] = defaultdict(set)
         self._observed_exact_quote_providers: set[str] = set()
         self._exact_quote_pair_cache = ExactQuotePairCache(
             max_buckets=max_exact_quote_pair_cache_buckets,
             max_records_per_bucket=max_exact_quote_pair_cache_records_per_bucket,
         )
-        self._linear_books: dict[tuple[str, str], CexTopOfBookEvent] = {}
-        self._linear_contexts: dict[tuple[str, str], object] = {}
+        self._linear_books: dict[
+            tuple[str, str], tuple[CexTopOfBookEvent, str, int]
+        ] = {}
+        self._linear_contexts: dict[tuple[str, str], tuple[object, str, int]] = {}
 
         self._dirty_bases: set[str] = set()
         self._wake = asyncio.Event()
@@ -567,7 +579,9 @@ class UnifiedPerpAnalyzer:
         self._perp_keys_by_base[perp.base].add(key)
         self._mark_dirty(perp.base)
 
-    def _update_generic_perp(self, value: PerpQuoteEvent, *, source: str) -> None:
+    def _update_generic_perp(self, event: MarketEvent) -> None:
+        value = event.value
+        assert isinstance(value, PerpQuoteEvent)
         base = value.base.upper()
         settlement = value.settlement.upper()
         if not base or not settlement:
@@ -601,12 +615,15 @@ class UnifiedPerpAnalyzer:
                 contract_type=value.contract_type,
                 contract_model=resolve_perp_contract_model(value.contract_type),
                 execution_model=value.execution_model,
-                source=source,
+                source=event.source,
+                source_epoch=event.source_epoch,
             ),
         )
         self._counts["perp_quote_events"] += 1
 
-    def _update_spot(self, value: CexTopOfBookEvent) -> None:
+    def _update_spot(self, event: MarketEvent) -> None:
+        value = event.value
+        assert isinstance(value, CexTopOfBookEvent)
         parsed = _stable_base_and_quote(value.symbol)
         if parsed is None:
             self._counts["unmapped_spot_book_events"] += 1
@@ -623,6 +640,8 @@ class UnifiedPerpAnalyzer:
             best_ask_size=value.best_ask_size,
             received_realtime_ns=value.received_realtime_ns,
             received_monotonic_ns=value.received_monotonic_ns,
+            source=event.source,
+            source_epoch=event.source_epoch,
         )
         old = self._spots.get(spot.key)
         if old is None or (
@@ -635,9 +654,11 @@ class UnifiedPerpAnalyzer:
         self._counts["spot_book_events"] += 1
         self._mark_dirty(base)
 
-    def _update_linear_book(self, value: CexTopOfBookEvent) -> None:
+    def _update_linear_book(self, event: MarketEvent) -> None:
+        value = event.value
+        assert isinstance(value, CexTopOfBookEvent)
         key = value.venue.upper(), value.symbol.upper()
-        self._linear_books[key] = value
+        self._linear_books[key] = (value, event.source, event.source_epoch)
         self._refresh_bybit_linear(key)
 
     def _update_linear_context(self, event: MarketEvent) -> None:
@@ -647,19 +668,27 @@ class UnifiedPerpAnalyzer:
             self._counts["malformed_linear_context_events"] += 1
             return
         key = "BYBIT", symbol.upper()
-        self._linear_contexts[key] = value
+        self._linear_contexts[key] = (value, event.source, event.source_epoch)
         self._refresh_bybit_linear(key)
 
     def _refresh_bybit_linear(self, key: tuple[str, str]) -> None:
-        book = self._linear_books.get(key)
-        if book is None:
+        book_state = self._linear_books.get(key)
+        if book_state is None:
             return
+        book, source, source_epoch = book_state
         parsed = _stable_base_and_quote(book.symbol)
         if parsed is None:
             self._counts["unmapped_linear_book_events"] += 1
             return
         base, settlement = parsed
-        context = self._linear_contexts.get(key)
+        context_state = self._linear_contexts.get(key)
+        context = (
+            context_state[0]
+            if context_state is not None
+            and context_state[1] == source
+            and context_state[2] == source_epoch
+            else None
+        )
         context_received = getattr(context, "received_realtime_ns", None)
         context_received_monotonic = getattr(context, "received_monotonic_ns", None)
         self._store_perp(
@@ -703,18 +732,92 @@ class UnifiedPerpAnalyzer:
                 contract_type="linear_perpetual",
                 contract_model=resolve_perp_contract_model("linear_perpetual"),
                 execution_model="central_limit_order_book",
-                source="cex:BYBIT:linear",
+                source=source,
+                source_epoch=source_epoch,
             ),
         )
         self._counts["linear_perp_book_or_context_events"] += 1
 
-    def handle_source_epoch_change(self, source: str, old_epoch: int, new_epoch: int) -> None:
-        """Purge all cached DEX quotes from the old source epoch."""
-        self._purge_dex_source_epoch(source, old_epoch)
+    def handle_source_epoch_change(
+        self,
+        change: SourceEpochChange | str,
+        old_epoch: int | None = None,
+        new_epoch: int | None = None,
+    ) -> None:
+        """Purge every cached leg owned by the previous source epoch."""
+
+        if isinstance(change, SourceEpochChange):
+            source = change.source
+            epoch = change.source_epoch
+        else:
+            if new_epoch is None:
+                raise TypeError("new_epoch is required for the legacy epoch callback")
+            source = change
+            epoch = new_epoch
+        current = self._current_source_epochs.get(source)
+        if current is not None and epoch <= current:
+            if epoch == current:
+                return
+            raise RuntimeError(f"source epoch regressed for {source!r}: {epoch} < {current}")
+        self._current_source_epochs[source] = epoch
+        invalidated_dex = self._purge_dex_source_epoch(source, epoch - 1)
+        invalidated_spots = 0
+        invalidated_perps = 0
+        for key, leg in tuple(self._spots.items()):
+            if leg.source == source and leg.source_epoch < epoch:
+                self._spots.pop(key, None)
+                self._spot_keys_by_base[leg.base].discard(key)
+                if not self._spot_keys_by_base[leg.base]:
+                    self._spot_keys_by_base.pop(leg.base, None)
+                invalidated_spots += 1
+        for key, leg in tuple(self._perps.items()):
+            if leg.source == source and leg.source_epoch < epoch:
+                self._perps.pop(key, None)
+                self._perp_keys_by_base[leg.base].discard(key)
+                if not self._perp_keys_by_base[leg.base]:
+                    self._perp_keys_by_base.pop(leg.base, None)
+                invalidated_perps += 1
+        self._linear_books = {
+            key: value
+            for key, value in self._linear_books.items()
+            if not (value[1] == source and value[2] < epoch)
+        }
+        self._linear_contexts = {
+            key: value
+            for key, value in self._linear_contexts.items()
+            if not (value[1] == source and value[2] < epoch)
+        }
+        self._dirty_bases.clear()
+        now_realtime_ns = self._realtime_ns()
+        now_monotonic_ns = self._monotonic_ns()
+        for key, state in tuple(self._active.items()):
+            self._active.pop(key)
+            self._candidate_closed += 1
+            if state.persisted:
+                self._persist_candidate_event(
+                    self._candidate_event(
+                        "candidate_closed",
+                        state,
+                        observed_realtime_ns=now_realtime_ns,
+                        observed_monotonic_ns=now_monotonic_ns,
+                        close_reason="source_epoch_advanced",
+                    ),
+                )
+            else:
+                self._counts["candidate_shorter_than_minimum_persistence"] += 1
+        if invalidated_dex:
+            self._exact_quote_pair_cache = ExactQuotePairCache(
+                max_buckets=self._exact_quote_pair_cache.max_buckets,
+                max_records_per_bucket=self._exact_quote_pair_cache.max_records_per_bucket,
+            )
+        self._counts["epoch_invalidated_spot_legs"] += invalidated_spots
+        self._counts["epoch_invalidated_perp_legs"] += invalidated_perps
+        self._capabilities_dirty = True
 
     def _remove_dex_quote_key(self, key: tuple[str, str, str]) -> bool:
         """Remove a DEX quote key from primary cache and all secondary indexes."""
         provider, _slot_id, _direction = key
+        self._dex_quote_provenance.pop(key, None)
         if key in self._dex_quotes:
             self._dex_quotes.pop(key, None)
             for base_set in self._dex_keys_by_base.values():
@@ -749,8 +852,8 @@ class UnifiedPerpAnalyzer:
         """Purge DEX quotes belonging to a source epoch that no longer owns them."""
         invalidated = 0
         for key in list(self._dex_quotes.keys()):
-            quote = self._dex_quotes.get(key)
-            if quote is not None and quote.source_epoch <= old_epoch:
+            provenance = self._dex_quote_provenance.get(key)
+            if provenance is not None and provenance[0] == source and provenance[1] <= old_epoch:
                 if self._remove_dex_quote_key(key):
                     invalidated += 1
         if invalidated:
@@ -763,6 +866,21 @@ class UnifiedPerpAnalyzer:
             self._capabilities_dirty = True
         self._counts["epoch_invalidated_dex_quotes"] += invalidated
         return invalidated
+
+    def _accept_event_epoch(self, event: MarketEvent) -> bool:
+        current = self._current_source_epochs.get(event.source)
+        if current is None:
+            self._current_source_epochs[event.source] = event.source_epoch
+            return True
+        if event.source_epoch < current:
+            self._counts["old_epoch_events_rejected"] += 1
+            return False
+        if event.source_epoch > current:
+            raise RuntimeError(
+                f"event epoch {event.source_epoch} for {event.source!r} arrived before "
+                f"SourceEpochChange from epoch {current}",
+            )
+        return True
 
     def _prune_expired_dex_quotes(self, now_monotonic_ns: int) -> int:
         """Physically remove DEX quotes older than the freshness TTL."""
@@ -785,7 +903,7 @@ class UnifiedPerpAnalyzer:
             self._counts["stale_dex_prunes"] += pruned
         return pruned
 
-    def _update_exact_quote(self, value: ExactInputQuote) -> None:
+    def _update_exact_quote(self, event: MarketEvent, value: ExactInputQuote) -> None:
         market = self._direct_markets.get(value.provider)
         if market is None:
             self._counts["unmapped_exact_quote_events"] += 1
@@ -812,6 +930,7 @@ class UnifiedPerpAnalyzer:
             self._counts["exact_quote_out_of_order_ignored"] += 1
             return
         self._dex_quotes[key] = value
+        self._dex_quote_provenance[key] = (event.source, event.source_epoch)
         self._dex_keys_by_base[market.cex_base_symbol.upper()].add(key)
         if value.provider not in self._observed_exact_quote_providers:
             self._observed_exact_quote_providers.add(value.provider)
@@ -826,16 +945,18 @@ class UnifiedPerpAnalyzer:
 
         if self._closed:
             return
+        if not self._accept_event_epoch(event):
+            return
         self._ensure_worker()
         self._counts["events_seen"] += 1
         if isinstance(event.value, PerpQuoteEvent):
-            self._update_generic_perp(event.value, source=event.source)
+            self._update_generic_perp(event)
             return
         if event.kind == "order_book" and isinstance(event.value, CexTopOfBookEvent):
             if event.value.category == "spot":
-                self._update_spot(event.value)
+                self._update_spot(event)
             elif event.value.category == "linear":
-                self._update_linear_book(event.value)
+                self._update_linear_book(event)
             return
         if event.kind == "perp_context" and event.source == "cex:BYBIT:linear":
             self._update_linear_context(event)
@@ -846,20 +967,30 @@ class UnifiedPerpAnalyzer:
                 if event.value.source_epoch == event.source_epoch
                 else replace(event.value, source_epoch=event.source_epoch)
             )
-            self._update_exact_quote(quote)
+            self._update_exact_quote(event, quote)
 
     def _perps_for_base(self, base: str) -> tuple[_PerpLeg, ...]:
         return tuple(
             self._perps[key]
             for key in sorted(self._perp_keys_by_base.get(base, ()))
-            if key in self._perps and self._perps[key].base == base
+            if key in self._perps
+            and self._perps[key].base == base
+            and self._current_source_epochs.get(
+                self._perps[key].source,
+                self._perps[key].source_epoch,
+            ) == self._perps[key].source_epoch
         )
 
     def _spots_for_base(self, base: str) -> tuple[_SpotLeg, ...]:
         return tuple(
             self._spots[key]
             for key in sorted(self._spot_keys_by_base.get(base, ()))
-            if key in self._spots and self._spots[key].base == base
+            if key in self._spots
+            and self._spots[key].base == base
+            and self._current_source_epochs.get(
+                self._spots[key].source,
+                self._spots[key].source_epoch,
+            ) == self._spots[key].source_epoch
         )
 
     def _quotes_for_base(self, base: str) -> tuple[tuple[ExactInputQuote, Any], ...]:
@@ -867,6 +998,11 @@ class UnifiedPerpAnalyzer:
         for key in sorted(self._dex_keys_by_base.get(base, ())):
             quote = self._dex_quotes.get(key)
             if quote is None:
+                continue
+            provenance = self._dex_quote_provenance.get(key)
+            if provenance is None or self._current_source_epochs.get(
+                provenance[0], provenance[1],
+            ) != provenance[1]:
                 continue
             market = self._direct_markets.get(quote.provider)
             if market is not None:
@@ -1257,7 +1393,7 @@ class UnifiedPerpAnalyzer:
                     if self._dirty_bases:
                         self._wake.set()
                     self._close_stale_candidates()
-                    self._prune_expired_dex_quotes(time.monotonic_ns())
+                    self._prune_expired_dex_quotes(self._monotonic_ns())
                     await asyncio.sleep(0)
                 except asyncio.CancelledError:
                     raise
@@ -1270,8 +1406,8 @@ class UnifiedPerpAnalyzer:
 
     def _evaluate_base(self, base: str) -> None:
         spots = self._spots_for_base(base)
-        now_ns = time.time_ns()
-        now_monotonic_ns = time.monotonic_ns()
+        now_ns = self._realtime_ns()
+        now_monotonic_ns = self._monotonic_ns()
         # A CEX-to-CEX trade is a complete paired inventory cycle when both
         # venues already hold the required base and quote balances.  It is
         # deliberately evaluated independently of whether this base also has
@@ -2893,7 +3029,7 @@ class UnifiedPerpAnalyzer:
     def _report_candidate_console(self, event: Mapping[str, Any]) -> None:
         if event["event"] in {"candidate_started", "candidate_improved"}:
             candidate_key = str(event["candidate_key"])
-            observed_ns = time.monotonic_ns()
+            observed_ns = self._monotonic_ns()
             last_report_ns = self._last_console_candidate_report_ns.get(candidate_key)
             if (
                 last_report_ns is not None
@@ -3087,8 +3223,8 @@ class UnifiedPerpAnalyzer:
         )
 
     def _close_stale_candidates(self) -> None:
-        now_realtime_ns = time.time_ns()
-        now_monotonic_ns = time.monotonic_ns()
+        now_realtime_ns = self._realtime_ns()
+        now_monotonic_ns = self._monotonic_ns()
         # A route with no new evaluation cannot remain active longer than the
         # strictest universal BBO freshness budget, even if its last observed
         # receive skew happened to be wider.
@@ -3165,7 +3301,7 @@ class UnifiedPerpAnalyzer:
             "status": "closed" if self._closed else "running",
             "mode": "event_driven_unified_perp_strategy_analysis",
             "started_at": self._started_at,
-            "updated_at": datetime.now(UTC).isoformat(),
+            "updated_at": _utc_iso_from_ns(self._realtime_ns()),
             "collector_connections_opened_by_analyzer": 0,
             "raw_market_data_persisted": False,
             "strategy_families": list(STRATEGY_FAMILIES),
@@ -3229,6 +3365,7 @@ class UnifiedPerpAnalyzer:
                 "unsupported_perp_contract_states": unsupported_contract_states,
             },
             "counts": dict(sorted(self._counts.items())),
+            "source_epochs": dict(sorted(self._current_source_epochs.items())),
            "candidate_lifecycle": {
                "started": self._candidate_started,
                "improved": self._candidate_improved,
@@ -3246,6 +3383,7 @@ class UnifiedPerpAnalyzer:
                 ),
                 "rejected_state_events": (
                     self._counts.get("old_epoch_exacts_ignored", 0)
+                    + self._counts.get("old_epoch_events_rejected", 0)
                     + self._counts.get("malformed_exact_quote_events", 0)
                     + self._counts.get("malformed_perp_events", 0)
                     + self._counts.get("unmapped_spot_book_events", 0)
@@ -3294,8 +3432,8 @@ class UnifiedPerpAnalyzer:
                 await self._worker_task
             except asyncio.CancelledError:
                 pass
-        now = time.time_ns()
-        now_monotonic_ns = time.monotonic_ns()
+        now = self._realtime_ns()
+        now_monotonic_ns = self._monotonic_ns()
         for key, state in tuple(self._active.items()):
             self._active.pop(key)
             self._candidate_closed += 1

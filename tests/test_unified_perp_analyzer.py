@@ -13,6 +13,7 @@ from market_data_lab.polling_quote_sources import ExactInputQuote
 from market_data_lab.realtime_scanner import MarketEvent
 from market_data_lab.solana_realtime_scanner import CexTopOfBookEvent
 from market_data_lab.unified_perp_analyzer import UnifiedPerpAnalyzer
+from market_data_lab.unified_perp_analyzer import _ActiveCandidate
 
 
 def _event(*, value: object, kind: str, now_real: int, now_mono: int) -> MarketEvent:
@@ -160,6 +161,44 @@ def _sequential_worker_bundle() -> dict[str, object]:
 
 
 class UnifiedPerpAnalyzerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_candidate_idle_lifecycle_uses_monotonic_not_wall_clock(self) -> None:
+        clocks = {"realtime": 10_000_000_000, "monotonic": 1_000_000_000}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            output.mkdir()
+            analyzer = UnifiedPerpAnalyzer(
+                output_directory=output,
+                monotonic_ns=lambda: clocks["monotonic"],
+                realtime_ns=lambda: clocks["realtime"],
+            )
+            state = _ActiveCandidate(
+                key="candidate",
+                analysis_kind="perp_perp_funding_carry",
+                started_realtime_ns=clocks["realtime"],
+                started_monotonic_ns=clocks["monotonic"],
+                started_at="start",
+                last_seen_realtime_ns=clocks["realtime"],
+                last_seen_monotonic_ns=clocks["monotonic"],
+                last_seen_at="start",
+                observations=1,
+                max_edge_bps=Decimal("1"),
+                max_pnl_usdt=Decimal("1"),
+                best_cycle={},
+                persisted=False,
+            )
+            analyzer._active[state.key] = state
+
+            clocks["realtime"] += 3_600_000_000_000
+            clocks["monotonic"] += 100_000_000
+            analyzer._close_stale_candidates()
+            self.assertIn(state.key, analyzer._active)
+
+            clocks["realtime"] -= 7_200_000_000_000
+            clocks["monotonic"] += 1_001_000_000
+            analyzer._close_stale_candidates()
+            self.assertNotIn(state.key, analyzer._active)
+            await analyzer.close()
+
     async def test_terminal_journal_appends_batches_and_stops_at_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "run"

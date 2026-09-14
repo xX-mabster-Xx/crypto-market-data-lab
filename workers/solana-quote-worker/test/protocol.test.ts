@@ -12,13 +12,23 @@ test("configuration accepts RPC endpoints but never needs a wallet", () => {
     meteora_dlmm_pools: [],
     orca_whirlpool_pools: [],
     state_snapshot_refresh_interval_ms: 15_000,
+    core_refresh_after_ms: 20_000,
+    maintenance_scan_interval_ms: 1_000,
+    refresh_stagger_window_ms: 5_000,
+    pool_state_emit_min_interval_ms: 100,
     rpc_http_min_request_interval_ms: 200,
+    rpc_max_pending_jobs: 256,
   });
   assert.equal(message.type, "configure");
   if (message.type === "configure") {
     assert.equal(message.raydium_clmm_pools[0]?.label, "SOL/USDC");
     assert.equal(message.state_snapshot_refresh_interval_ms, 15_000);
+    assert.equal(message.core_refresh_after_ms, 20_000);
+    assert.equal(message.maintenance_scan_interval_ms, 1_000);
+    assert.equal(message.refresh_stagger_window_ms, 5_000);
+    assert.equal(message.pool_state_emit_min_interval_ms, 100);
     assert.equal(message.rpc_http_min_request_interval_ms, 200);
+    assert.equal(message.rpc_max_pending_jobs, 256);
   }
 });
 

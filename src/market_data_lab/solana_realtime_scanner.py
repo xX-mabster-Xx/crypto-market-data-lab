@@ -28,7 +28,6 @@ from typing import Any
 
 from market_data_lab.cex_book_streams import PublicBookStream
 from market_data_lab.cex_book_streams import build_public_book_stream
-from market_data_lab.cex_book_streams import stream_health
 from market_data_lab.account_fee_audit import load_spot_fee_audit
 from market_data_lab.cex_dex_cycles import BookSnapshot
 from market_data_lab.jupiter_gated_verifier import JupiterGatedVerifier
@@ -43,15 +42,18 @@ from market_data_lab.raydium_clmm_prefilter import fetch_clmm_pool_states
 from market_data_lab.realtime_scanner import MarketEvent
 from market_data_lab.realtime_scanner import RealtimeScanner
 from market_data_lab.realtime_scanner import ScannerSource
+from market_data_lab.realtime_scanner import SourceEpochChange
+from market_data_lab.realtime_scanner import TransportReconnectRequired
 from market_data_lab.solana_quote_worker import QuoteWorkerPool
 from market_data_lab.solana_quote_worker import RaydiumLocalQuoteWorker
 from market_data_lab.solana_quote_worker import RaydiumStandardQuoteWorkerPool
 from market_data_lab.solana_route_evaluator import LocalRouteEvaluatorConfig
 from market_data_lab.solana_route_evaluator import LocalSpotRoute
+from market_data_lab.solana_route_evaluator import CexDepthState
 from market_data_lab.solana_route_evaluator import SolanaRouteEvaluator
 
 
-Publish = Callable[[MarketEvent], Awaitable[None]]
+Publish = Callable[[MarketEvent], Awaitable[Any]]
 
 
 @dataclass(frozen=True)
@@ -130,13 +132,31 @@ class RaydiumLocalQuoteWorkerConfig:
     enabled: bool = False
     tick_cache_max_age_ms: int = 300_000
     state_snapshot_refresh_interval_ms: int = 15_000
+    core_refresh_after_ms: int = 15_000
+    maintenance_scan_interval_ms: int = 1_000
+    refresh_stagger_window_ms: int = 5_000
+    pool_state_emit_min_interval_ms: int = 100
     rpc_http_min_request_interval_ms: int = 200
+
+    def __post_init__(self) -> None:
+        if self.core_refresh_after_ms < 1_000:
+            raise ValueError("core_refresh_after_ms must be at least 1000")
+        if self.maintenance_scan_interval_ms < 100:
+            raise ValueError("maintenance_scan_interval_ms must be at least 100")
+        if not 0 < self.refresh_stagger_window_ms <= self.core_refresh_after_ms:
+            raise ValueError("refresh_stagger_window_ms must be positive and no larger than core refresh")
+        if self.pool_state_emit_min_interval_ms <= 0:
+            raise ValueError("pool_state_emit_min_interval_ms must be positive")
 
     def safe_descriptor(self) -> dict[str, object]:
         return {
             "enabled": self.enabled,
             "tick_cache_max_age_ms": self.tick_cache_max_age_ms,
             "state_snapshot_refresh_interval_ms": self.state_snapshot_refresh_interval_ms,
+            "core_refresh_after_ms": self.core_refresh_after_ms,
+            "maintenance_scan_interval_ms": self.maintenance_scan_interval_ms,
+            "refresh_stagger_window_ms": self.refresh_stagger_window_ms,
+            "pool_state_emit_min_interval_ms": self.pool_state_emit_min_interval_ms,
             "rpc_http_min_request_interval_ms": self.rpc_http_min_request_interval_ms,
             "mode": "local_typescript_sdk_exact_input_quote",
             "wallet_or_private_key_used": False,
@@ -294,6 +314,7 @@ class SolanaScannerConfig:
     retention_seconds: float
     max_events_per_key: int
     event_bus_capacity: int
+    max_state_keys: int
     status_flush_seconds: float
     sequential_amm_pool: SequentialAmmPoolConfig | None = None
 
@@ -383,22 +404,7 @@ def _positive_float(payload: Mapping[str, Any], key: str, default: float) -> flo
 
 
 def _positive_int(payload: Mapping[str, Any], key: str, default: int) -> int:
-    value = payload.get(key, default)
-    if isinstance(value, bool):
-        raise ValueError(f"configuration field {key!r} must be a positive integer")
-    try:
-        if isinstance(value, float):
-            if not value.is_integer():
-                raise ValueError(f"configuration field {key!r} must be an integer, not a fractional float")
-            parsed = int(value)
-        elif isinstance(value, Decimal):
-            if not value.is_finite() or not value == value.to_integral_value():
-                raise ValueError(f"configuration field {key!r} must be a finite integer")
-            parsed = int(value)
-        else:
-            parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"configuration field {key!r} must be a positive integer") from exc
+    parsed = _strict_integer(payload.get(key, default), key, positive=True)
     if parsed <= 0:
         raise ValueError(f"configuration field {key!r} must be positive")
     return parsed
@@ -418,18 +424,43 @@ def _finite_decimal(payload: Mapping[str, Any], key: str, default: Decimal) -> D
 
 
 def _non_negative_int(payload: Mapping[str, Any], key: str, default: int) -> int:
-    value = payload.get(key, default)
-    if isinstance(value, bool):
-        raise ValueError(f"configuration field {key!r} must be a non-negative integer")
-    if isinstance(value, float):
-        if not math.isfinite(value) or not value.is_integer():
-            raise ValueError(f"configuration field {key!r} must be a non-negative integer")
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"configuration field {key!r} must be a non-negative integer") from exc
+    parsed = _strict_integer(payload.get(key, default), key, positive=False)
     if parsed < 0:
         raise ValueError(f"configuration field {key!r} must be non-negative")
+    return parsed
+
+
+def _strict_integer(value: Any, key: str, *, positive: bool) -> int:
+    """Parse an integer config value without truncating fractional numbers.
+
+    TOML normally gives us ``int``/``float`` values, while a few callers and
+    tests provide ``Decimal`` values directly.  ``int(value)`` is unsafe for
+    the latter because it silently turns ``Decimal("1.9")`` into ``1``.
+    Keep the accepted string policy deliberately narrow (the exact integer
+    spelling accepted by ``int``) and reject bools, non-finite values, and
+    every non-integral numeric value before conversion.
+    """
+
+    kind = "positive integer" if positive else "non-negative integer"
+    if isinstance(value, bool):
+        raise ValueError(f"configuration field {key!r} must be a {kind}")
+    try:
+        if isinstance(value, float):
+            if not math.isfinite(value) or not value.is_integer():
+                raise ValueError
+            parsed = int(value)
+        elif isinstance(value, Decimal):
+            if not value.is_finite() or value != value.to_integral_value():
+                raise ValueError
+            parsed = int(value)
+        elif isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            parsed = int(value)
+        else:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"configuration field {key!r} must be a {kind}") from exc
     return parsed
 
 
@@ -868,6 +899,30 @@ def load_solana_scanner_config(path: Path) -> SolanaScannerConfig:
                 "state_snapshot_refresh_interval_ms",
                 15_000,
             ),
+            core_refresh_after_ms=_positive_int(
+                local_quote_worker,
+                "core_refresh_after_ms",
+                _positive_int(
+                    local_quote_worker,
+                    "state_snapshot_refresh_interval_ms",
+                    15_000,
+                ),
+            ),
+            maintenance_scan_interval_ms=_positive_int(
+                local_quote_worker,
+                "maintenance_scan_interval_ms",
+                1_000,
+            ),
+            refresh_stagger_window_ms=_positive_int(
+                local_quote_worker,
+                "refresh_stagger_window_ms",
+                5_000,
+            ),
+            pool_state_emit_min_interval_ms=_positive_int(
+                local_quote_worker,
+                "pool_state_emit_min_interval_ms",
+                100,
+            ),
             rpc_http_min_request_interval_ms=_positive_int(
                 local_quote_worker,
                 "rpc_http_min_request_interval_ms",
@@ -880,6 +935,7 @@ def load_solana_scanner_config(path: Path) -> SolanaScannerConfig:
     retention_seconds=_positive_float(scanner, "retention_seconds", 180.0),
         max_events_per_key=_positive_int(scanner, "max_events_per_key", 4_096),
         event_bus_capacity=_positive_int(scanner, "event_bus_capacity", 8_192),
+        max_state_keys=_positive_int(scanner, "max_state_keys", 65_536),
         status_flush_seconds=_positive_float(scanner, "status_flush_seconds", 2.0),
     )
 
@@ -999,6 +1055,10 @@ class RaydiumLocalQuoteStateSource:
     tick_cache_max_age_ms: int
     state_snapshot_refresh_interval_ms: int
     rpc_http_min_request_interval_ms: int
+    core_refresh_after_ms: int = 15_000
+    maintenance_scan_interval_ms: int = 1_000
+    refresh_stagger_window_ms: int = 5_000
+    pool_state_emit_min_interval_ms: int = 100
     amm_simulation_enabled: bool = False
     allowed_protocols: tuple[str, ...] = ()
     name: str = "solana:local-exact-pools"
@@ -1031,6 +1091,10 @@ class RaydiumLocalQuoteStateSource:
             "meteora_dlmm_pools": [pool.pool_id for pool in self.meteora_pools],
             "orca_whirlpool_pools": [pool.pool_id for pool in self.orca_pools],
             "state_snapshot_refresh_interval_ms": self.state_snapshot_refresh_interval_ms,
+            "core_refresh_after_ms": self.core_refresh_after_ms,
+            "maintenance_scan_interval_ms": self.maintenance_scan_interval_ms,
+            "refresh_stagger_window_ms": self.refresh_stagger_window_ms,
+            "pool_state_emit_min_interval_ms": self.pool_state_emit_min_interval_ms,
             "rpc_http_min_request_interval_ms": self.rpc_http_min_request_interval_ms,
             "credentials_required": False,
             "wallet_or_private_key_used": False,
@@ -1151,6 +1215,10 @@ class RaydiumLocalQuoteStateSource:
             ),
             tick_cache_max_age_ms=self.tick_cache_max_age_ms,
             state_snapshot_refresh_interval_ms=self.state_snapshot_refresh_interval_ms,
+            core_refresh_after_ms=self.core_refresh_after_ms,
+            maintenance_scan_interval_ms=self.maintenance_scan_interval_ms,
+            refresh_stagger_window_ms=self.refresh_stagger_window_ms,
+            pool_state_emit_min_interval_ms=self.pool_state_emit_min_interval_ms,
             rpc_http_min_request_interval_ms=self.rpc_http_min_request_interval_ms,
         )
         self._client = client
@@ -1210,6 +1278,10 @@ class RaydiumLocalQuoteStateSource:
                 label = message.get("label")
                 protocol = message.get("protocol")
                 slot = message.get("slot")
+                core_state_slot = message.get("core_state_slot")
+                dependency_slot_min = message.get("dependency_slot_min")
+                dependency_slot_max = message.get("dependency_slot_max")
+                dependency_generation = message.get("dependency_generation")
                 token_a_mint = message.get("token_a_mint")
                 token_b_mint = message.get("token_b_mint")
                 token_a_decimals = message.get("token_a_decimals")
@@ -1228,6 +1300,26 @@ class RaydiumLocalQuoteStateSource:
                 ):
                     raise RuntimeError("local quote worker pool-state protocol/slot is malformed")
                 if (
+                    not isinstance(core_state_slot, int)
+                    or core_state_slot != slot
+                    or (
+                        dependency_slot_min is not None
+                        and not isinstance(dependency_slot_min, int)
+                    )
+                    or (
+                        dependency_slot_max is not None
+                        and not isinstance(dependency_slot_max, int)
+                    )
+                    or not isinstance(dependency_generation, int)
+                    or dependency_generation < 0
+                    or (
+                        dependency_slot_min is not None
+                        and dependency_slot_max is not None
+                        and dependency_slot_min > dependency_slot_max
+                    )
+                ):
+                    raise RuntimeError("local quote worker pool-state provenance is malformed")
+                if (
                     not isinstance(token_a_mint, str)
                     or not isinstance(token_b_mint, str)
                     or not isinstance(token_a_decimals, int)
@@ -1244,6 +1336,10 @@ class RaydiumLocalQuoteStateSource:
                     "token_a_decimals": token_a_decimals,
                     "token_b_decimals": token_b_decimals,
                     "slot": slot,
+                    "core_state_slot": core_state_slot,
+                    "dependency_slot_min": dependency_slot_min,
+                    "dependency_slot_max": dependency_slot_max,
+                    "dependency_generation": dependency_generation,
                     "quote_engine": "local_typescript_sdk",
                 }
                 if protocol == "raydium_clmm":
@@ -1413,7 +1509,10 @@ class CexBookStateSource:
     # current book per symbol.  The generic scanner history receives the
     # lightweight :class:`CexTopOfBookEvent` above instead.
     _latest_books: dict[str, BookSnapshot] = field(default_factory=dict, init=False, repr=False)
+    _latest_depths: dict[str, CexDepthState] = field(default_factory=dict, init=False, repr=False)
     _stream: PublicBookStream | None = field(default=None, init=False, repr=False)
+    _source_epoch: int = field(default=0, init=False, repr=False)
+    _event_counter: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.full_depth_history_capacity_per_symbol <= 0:
@@ -1423,6 +1522,10 @@ class CexBookStateSource:
     def name(self) -> str:
         return f"cex:{self.config.venue}:{self.config.category}"
 
+    @property
+    def source_epoch(self) -> int:
+        return self._source_epoch
+
     def describe(self) -> Mapping[str, Any]:
         return {
             "source": self.name,
@@ -1430,6 +1533,9 @@ class CexBookStateSource:
             "category": self.config.category,
             "symbols": list(self.config.symbols),
             "mode": "public_websocket",
+            "generic_store_payload": "compact_top_of_book",
+            "full_depth_provider": "bounded_latest_with_source_epoch_and_event_provenance",
+            "full_depth_history_capacity_per_symbol": self.full_depth_history_capacity_per_symbol,
             "credentials_required": False,
             "transactions_submitted": False,
         }
@@ -1444,11 +1550,38 @@ class CexBookStateSource:
 
         return self._latest_books.get(symbol.upper())
 
+    def latest_depth(self, venue: str, symbol: str) -> CexDepthState | None:
+        """Return full depth only when it belongs to this source's current epoch."""
+
+        if venue.upper() != self.config.venue.upper():
+            return None
+        depth = self._latest_depths.get(symbol.upper())
+        if depth is None or depth.source_epoch != self._source_epoch:
+            return None
+        return depth
+
+    def handle_source_epoch(self, change: SourceEpochChange) -> None:
+        if change.source != self.name:
+            return
+        if change.source_epoch <= self._source_epoch:
+            if change.source_epoch == self._source_epoch:
+                return
+            raise RuntimeError(
+                f"source epoch regressed for {self.name}: "
+                f"{change.source_epoch} < {self._source_epoch}",
+            )
+        self._latest_books.clear()
+        self._latest_depths.clear()
+        self._source_epoch = change.source_epoch
+        self._event_counter = 0
+
     async def run(self, publish: Publish, stop_event: asyncio.Event) -> None:
         # A supervisor restart starts a new source epoch.  Full-depth books
         # from the disconnected stream must not remain available to later
         # execution checks while the replacement stream is still syncing.
         self._latest_books.clear()
+        self._latest_depths.clear()
+        self._event_counter = 0
         stream: PublicBookStream = build_public_book_stream(
             self.config.venue,
             self.config.symbols,
@@ -1469,9 +1602,9 @@ class CexBookStateSource:
                     if error:
                         raise RuntimeError(str(error))
                     continue
-                self._latest_books[book.symbol] = book
-                await publish(
-                    MarketEvent(
+                self._event_counter += 1
+                event_id = f"depth:{self.name}:{self._source_epoch}:{self._event_counter}"
+                event = MarketEvent(
                         source=self.name,
                         key=f"{self.name}:{book.symbol}",
                         kind="order_book",
@@ -1483,8 +1616,21 @@ class CexBookStateSource:
                         received_realtime_ns=book.response.received_realtime_ns,
                         received_monotonic_ns=book.response.received_monotonic_ns,
                         chain_position=book.update_id,
-                    ),
+                        event_id=event_id,
+                        source_epoch=self._source_epoch,
+                    )
+                depth = CexDepthState(
+                    book=book,
+                    source=self.name,
+                    source_epoch=self._source_epoch,
+                    event_id=event_id,
+                    received_realtime_ns=book.response.received_realtime_ns,
+                    received_monotonic_ns=book.response.received_monotonic_ns,
                 )
+                publish_result = await publish(event)
+                if publish_result is None or bool(getattr(publish_result, "accepted", True)):
+                    self._latest_books[book.symbol] = book
+                    self._latest_depths[book.symbol] = depth
                 # Bybit linear carries a delta-compressed public ticker on
                 # the same connection.  Preserve it as a separate normalized
                 # state type rather than silently treating a book update as a
@@ -1516,14 +1662,40 @@ class CexBookStateSource:
                                 ),
                             ),
                         )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise TransportReconnectRequired(
+                f"{self.name} transport session failed: {exc}",
+            ) from exc
         finally:
-            health = stream_health(stream)
             await stream.close()
             self._stream = None
-            # Preserve useful health in the exception path without exposing
-            # full book state.  The supervisor will surface the concise error.
-            if health.get("error") and not stop_event.is_set():
-                raise RuntimeError(str(health["error"]))
+
+
+@dataclass(frozen=True, slots=True)
+class CexDepthResolver:
+    """Resolve one venue/symbol across the configured bounded CEX sources."""
+
+    sources: tuple[CexBookStateSource, ...]
+
+    def __post_init__(self) -> None:
+        keys = [
+            (source.config.venue.upper(), source.config.category)
+            for source in self.sources
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("CEX depth sources must be unique by venue/category")
+
+    def latest_depth(self, venue: str, symbol: str) -> CexDepthState | None:
+        normalized_venue = venue.upper()
+        for source in self.sources:
+            if (
+                source.config.category == "spot"
+                and source.config.venue.upper() == normalized_venue
+            ):
+                return source.latest_depth(normalized_venue, symbol)
+        return None
 
 
 def _routes_with_account_fee_audit(
@@ -1566,6 +1738,64 @@ def _routes_with_account_fee_audit(
     return tuple(effective)
 
 
+def build_local_route_evaluator(
+    config: SolanaScannerConfig,
+    *,
+    store: Any,
+    quote_source: RaydiumClmmStateSource | RaydiumLocalQuoteStateSource,
+    cex_sources: Sequence[CexBookStateSource],
+    output_directory: Path,
+) -> SolanaRouteEvaluator | None:
+    """Create the configured evaluator with explicit quote/depth dependencies."""
+
+    settings = config.local_route_evaluator
+    if not bool(getattr(settings, "enabled", False)):
+        return None
+    if not getattr(settings, "routes", ()):
+        raise ValueError("local_route_evaluator.enabled requires at least one hot route")
+    if not isinstance(quote_source, RaydiumLocalQuoteStateSource):
+        raise ValueError(
+            "local_route_evaluator requires the managed local Raydium quote worker",
+        )
+    spot_symbols_by_venue = {
+        source.config.venue.upper(): {symbol.upper() for symbol in source.config.symbols}
+        for source in cex_sources
+        if source.config.category == "spot"
+    }
+    for route in settings.routes:
+        configured = spot_symbols_by_venue.get(route.cex_venue.upper(), set())
+        required = {route.base_cex_symbol.upper()}
+        if route.bridge_cex_symbol is not None:
+            required.add(route.bridge_cex_symbol.upper())
+        missing = sorted(required - configured)
+        if missing:
+            raise ValueError(
+                f"local route {route.route_id!r} has no CEX depth subscription for "
+                f"{route.cex_venue}: {', '.join(missing)}",
+            )
+    effective_settings = replace(
+        settings,
+        routes=_routes_with_account_fee_audit(settings),
+    )
+    return SolanaRouteEvaluator(
+        config=effective_settings.to_evaluator_config(),
+        store=store,
+        quote_source=quote_source,
+        output_directory=output_directory,
+        depth_provider=CexDepthResolver(tuple(cex_sources)),
+        gated_verifier=(
+            JupiterGatedVerifier(
+                api_key=config.jupiter.api_key,
+                minimum_request_interval_seconds=config.jupiter.minimum_request_interval_seconds,
+                proxy_url=config.proxy_url,
+                timeout_seconds=config.timeout_seconds,
+            )
+            if config.jupiter.enabled
+            else None
+        ),
+    )
+
+
 def build_solana_market_sources(
     config: SolanaScannerConfig,
 ) -> tuple[
@@ -1594,6 +1824,18 @@ def build_solana_market_sources(
             tick_cache_max_age_ms=config.raydium_local_quote_worker.tick_cache_max_age_ms,
             state_snapshot_refresh_interval_ms=(
                 config.raydium_local_quote_worker.state_snapshot_refresh_interval_ms
+            ),
+            core_refresh_after_ms=(
+                config.raydium_local_quote_worker.core_refresh_after_ms
+            ),
+            maintenance_scan_interval_ms=(
+                config.raydium_local_quote_worker.maintenance_scan_interval_ms
+            ),
+            refresh_stagger_window_ms=(
+                config.raydium_local_quote_worker.refresh_stagger_window_ms
+            ),
+            pool_state_emit_min_interval_ms=(
+                config.raydium_local_quote_worker.pool_state_emit_min_interval_ms
             ),
             rpc_http_min_request_interval_ms=(
                 config.raydium_local_quote_worker.rpc_http_min_request_interval_ms
@@ -1642,36 +1884,30 @@ def build_solana_scanner(config: SolanaScannerConfig, *, output_directory: Path)
         retention_seconds=config.retention_seconds,
         max_events_per_key=config.max_events_per_key,
         event_bus_capacity=config.event_bus_capacity,
+        max_state_keys=config.max_state_keys,
         status_flush_seconds=config.status_flush_seconds,
     )
-    if config.local_route_evaluator.enabled:
-        if not isinstance(raydium_source, RaydiumLocalQuoteStateSource):
-            raise ValueError(
-                "local_route_evaluator requires the managed local Raydium quote worker",
-            )
-        effective_settings = replace(
-            config.local_route_evaluator,
-            routes=_routes_with_account_fee_audit(config.local_route_evaluator),
-        )
-        evaluator = SolanaRouteEvaluator(
-            config=effective_settings.to_evaluator_config(),
-            store=scanner.store,
-            quote_source=raydium_source,
-            output_directory=output_directory,
-            gated_verifier=(
-                JupiterGatedVerifier(
-                    api_key=config.jupiter.api_key,
-                    minimum_request_interval_seconds=config.jupiter.minimum_request_interval_seconds,
-                    proxy_url=config.proxy_url,
-                    timeout_seconds=config.timeout_seconds,
-                )
-                if config.jupiter.enabled
-                else None
-            ),
-        )
+    cex_sources = tuple(source for source in sources if isinstance(source, CexBookStateSource))
+    evaluator = build_local_route_evaluator(
+        config,
+        store=scanner.store,
+        quote_source=raydium_source,
+        cex_sources=cex_sources,
+        output_directory=output_directory,
+    )
+    scanner.epoch_change_handlers = tuple(
+        source.handle_source_epoch for source in cex_sources
+    ) + ((evaluator.handle_source_epoch,) if evaluator is not None else ())
+    if evaluator is not None:
         scanner.event_handler = evaluator.handle_event
         scanner.status_providers = {"local_route_evaluator": evaluator.snapshot}
         scanner.shutdown_handlers = (evaluator.close,)
+    scanner.runtime_components = {
+        "local_route_evaluator_requested": bool(config.local_route_evaluator.enabled),
+        "local_route_evaluator_attached": evaluator is not None,
+        "local_route_count": len(evaluator.config.routes) if evaluator is not None else 0,
+        "local_quote_worker_attached": isinstance(raydium_source, RaydiumLocalQuoteStateSource),
+    }
     return scanner
 
 

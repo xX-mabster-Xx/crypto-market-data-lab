@@ -4,6 +4,12 @@
  * signer, transaction, or order message type.
  */
 
+import {
+  ProtocolEmitter,
+  type ProtocolOutputFatalError,
+  type ProtocolOutputMetrics,
+} from "./outputWriter.js";
+
 export interface PoolDescriptor {
   pool_id: string;
   label: string;
@@ -23,7 +29,12 @@ export interface ConfigureMessage {
   orca_whirlpool_pools: PoolDescriptor[];
   tick_cache_max_age_ms?: number;
   state_snapshot_refresh_interval_ms?: number;
+  core_refresh_after_ms?: number;
+  maintenance_scan_interval_ms?: number;
+  refresh_stagger_window_ms?: number;
+  pool_state_emit_min_interval_ms?: number;
   rpc_http_min_request_interval_ms?: number;
+  rpc_max_pending_jobs?: number;
   simulation_snapshot_ttl_ms?: number;
 }
 
@@ -247,12 +258,41 @@ export function parseWorkerInput(value: unknown): WorkerInput {
     if (stateSnapshotRefreshIntervalMs !== undefined && stateSnapshotRefreshIntervalMs < 1_000) {
       throw new Error("state_snapshot_refresh_interval_ms must be at least 1000 when supplied");
     }
+    const coreRefreshAfterMs = positiveIntegerField(payload, "core_refresh_after_ms");
+    if (coreRefreshAfterMs !== undefined && coreRefreshAfterMs < 1_000) {
+      throw new Error("core_refresh_after_ms must be at least 1000 when supplied");
+    }
+    const maintenanceScanIntervalMs = positiveIntegerField(payload, "maintenance_scan_interval_ms");
+    if (maintenanceScanIntervalMs !== undefined && maintenanceScanIntervalMs < 100) {
+      throw new Error("maintenance_scan_interval_ms must be at least 100 when supplied");
+    }
+    const refreshStaggerWindowMs = positiveIntegerField(payload, "refresh_stagger_window_ms");
+    const effectiveCoreRefreshAfterMs = coreRefreshAfterMs
+      ?? stateSnapshotRefreshIntervalMs
+      ?? 15_000;
+    if (
+      refreshStaggerWindowMs !== undefined
+      && (refreshStaggerWindowMs === 0 || refreshStaggerWindowMs > effectiveCoreRefreshAfterMs)
+    ) {
+      throw new Error("refresh_stagger_window_ms must be positive and no larger than core refresh");
+    }
+    const poolStateEmitMinIntervalMs = positiveIntegerField(
+      payload,
+      "pool_state_emit_min_interval_ms",
+    );
+    if (poolStateEmitMinIntervalMs !== undefined && poolStateEmitMinIntervalMs === 0) {
+      throw new Error("pool_state_emit_min_interval_ms must be positive when supplied");
+    }
     const rpcHttpMinRequestIntervalMs = positiveIntegerField(
       payload,
       "rpc_http_min_request_interval_ms",
     );
     if (rpcHttpMinRequestIntervalMs !== undefined && rpcHttpMinRequestIntervalMs < 25) {
       throw new Error("rpc_http_min_request_interval_ms must be at least 25 when supplied");
+    }
+    const rpcMaxPendingJobs = positiveIntegerField(payload, "rpc_max_pending_jobs");
+    if (rpcMaxPendingJobs !== undefined && rpcMaxPendingJobs === 0) {
+      throw new Error("rpc_max_pending_jobs must be positive when supplied");
     }
     const simulationSnapshotTtlMs = positiveIntegerField(payload, "simulation_snapshot_ttl_ms");
     if (simulationSnapshotTtlMs !== undefined && simulationSnapshotTtlMs === 0) {
@@ -282,9 +322,20 @@ export function parseWorkerInput(value: unknown): WorkerInput {
       ...(stateSnapshotRefreshIntervalMs === undefined
         ? {}
         : { state_snapshot_refresh_interval_ms: stateSnapshotRefreshIntervalMs }),
+      ...(coreRefreshAfterMs === undefined ? {} : { core_refresh_after_ms: coreRefreshAfterMs }),
+      ...(maintenanceScanIntervalMs === undefined
+        ? {}
+        : { maintenance_scan_interval_ms: maintenanceScanIntervalMs }),
+      ...(refreshStaggerWindowMs === undefined
+        ? {}
+        : { refresh_stagger_window_ms: refreshStaggerWindowMs }),
+      ...(poolStateEmitMinIntervalMs === undefined
+        ? {}
+        : { pool_state_emit_min_interval_ms: poolStateEmitMinIntervalMs }),
       ...(rpcHttpMinRequestIntervalMs === undefined
         ? {}
         : { rpc_http_min_request_interval_ms: rpcHttpMinRequestIntervalMs }),
+      ...(rpcMaxPendingJobs === undefined ? {} : { rpc_max_pending_jobs: rpcMaxPendingJobs }),
       ...(simulationSnapshotTtlMs === undefined
         ? {}
         : { simulation_snapshot_ttl_ms: simulationSnapshotTtlMs }),
@@ -401,6 +452,56 @@ export function safeError(error: unknown): string {
   return redactUrls(message).slice(0, 512);
 }
 
-export function emit(message: Record<string, unknown>): void {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+function positiveEnvironmentInteger(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^[1-9][0-9]*$/u.test(raw)) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+  return parsed;
+}
+
+let outputFatalHandler = (error: ProtocolOutputFatalError): void => {
+  process.stderr.write(`[worker-output-fatal] ${safeError(error)}\n`);
+  process.exitCode = 1;
+};
+
+const protocolEmitter = new ProtocolEmitter(process.stdout, {
+  maxLosslessQueue: positiveEnvironmentInteger("WORKER_MAX_LOSSLESS_OUTPUT_QUEUE", 1_024),
+  maxStatePendingKeys: positiveEnvironmentInteger("WORKER_MAX_STATE_OUTPUT_KEYS", 65_536),
+  onFatal: (error) => outputFatalHandler(error),
+});
+
+export function setProtocolOutputFatalHandler(
+  handler: (error: ProtocolOutputFatalError) => void,
+): void {
+  outputFatalHandler = handler;
+}
+
+export function emitLossless(message: Record<string, unknown>): boolean {
+  return protocolEmitter.emitLossless(message);
+}
+
+export function emitState(
+  coalesceKey: string,
+  message: Record<string, unknown>,
+): boolean {
+  return protocolEmitter.emitState(coalesceKey, message);
+}
+
+/** Compatibility wrapper for low-frequency control/result call sites. */
+export function emit(message: Record<string, unknown>): boolean {
+  return emitLossless(message);
+}
+
+export function protocolOutputMetrics(): ProtocolOutputMetrics {
+  return protocolEmitter.metrics();
+}
+
+export async function closeProtocolOutput(timeoutMs = 5_000): Promise<void> {
+  await protocolEmitter.drainAndClose(timeoutMs);
 }

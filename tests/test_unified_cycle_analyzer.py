@@ -17,6 +17,7 @@ from market_data_lab.realtime_scanner import MarketEvent
 from market_data_lab.solana_realtime_scanner import CexBookStateSource
 from market_data_lab.solana_realtime_scanner import CexStreamConfig
 from market_data_lab.unified_cycle_analyzer import UnifiedCycleAnalyzer
+from market_data_lab.unified_cycle_analyzer import _ActiveCandidate
 
 
 def _good_quote(*, now_realtime_ns: int, now_monotonic_ns: int) -> ExactInputQuote:
@@ -76,6 +77,48 @@ def _book(*, symbol: str, now_realtime_ns: int, now_monotonic_ns: int) -> BookSn
 
 
 class UnifiedCycleAnalyzerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_candidate_idle_lifecycle_uses_monotonic_not_wall_clock(self) -> None:
+        clocks = {"realtime": 10_000_000_000, "monotonic": 1_000_000_000}
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            output.mkdir()
+            analyzer = UnifiedCycleAnalyzer(
+                output_directory=output,
+                cex_sources=(),
+                max_response_skew_ms=Decimal("1000"),
+                monotonic_ns=lambda: clocks["monotonic"],
+                realtime_ns=lambda: clocks["realtime"],
+            )
+            state = _ActiveCandidate(
+                key="candidate",
+                analysis_kind="direct_inventory",
+                started_realtime_ns=clocks["realtime"],
+                started_monotonic_ns=clocks["monotonic"],
+                started_at="start",
+                last_seen_realtime_ns=clocks["realtime"],
+                last_seen_monotonic_ns=clocks["monotonic"],
+                last_seen_at="start",
+                observations=1,
+                max_edge_bps=Decimal("1"),
+                max_pnl_quote=Decimal("1"),
+                best_cycle={},
+            )
+            analyzer._active[state.key] = state
+
+            # Wall clock jumps by an hour, while only 100ms elapsed locally.
+            clocks["realtime"] += 3_600_000_000_000
+            clocks["monotonic"] += 100_000_000
+            analyzer._close_stale_candidates()
+            self.assertIn(state.key, analyzer._active)
+
+            # A backward wall-clock correction must not prevent a monotonic
+            # timeout from closing the candidate.
+            clocks["realtime"] -= 7_200_000_000_000
+            clocks["monotonic"] += 1_001_000_000
+            analyzer._close_stale_candidates()
+            self.assertNotIn(state.key, analyzer._active)
+
     async def test_records_bounded_modelled_lifecycle_without_requerying_sources(self) -> None:
         now_realtime_ns = time.time_ns()
         now_monotonic_ns = time.monotonic_ns()
@@ -291,7 +334,7 @@ class UnifiedCycleAnalyzerTest(unittest.IsolatedAsyncioTestCase):
             )
             key = analyzer._quote_key(old_quote)
             self.assertIn(key, analyzer._direct_quotes)
-            removed = analyzer._purge_source_epoch("test", old_epoch=2)
+            removed = analyzer._purge_source_epoch("dexquote:RAYDIUM", old_epoch=2)
             self.assertGreaterEqual(removed, 1)
             self.assertNotIn(key, analyzer._direct_quotes)
             self.assertNotIn(key, analyzer._quote_keys_by_direct_provider[old_quote.provider])

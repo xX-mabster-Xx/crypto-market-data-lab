@@ -1,0 +1,321 @@
+diff --git a/src/market_data_lab/realtime_scanner.py b/src/market_data_lab/realtime_scanner.py
+--- a/src/market_data_lab/realtime_scanner.py
++++ b/src/market_data_lab/realtime_scanner.py
+@@ -1,6 +1,5 @@
+ from __future__ import annotations
+ import asyncio
+-import contextlib
+ import math
+ import time
+ import uuid
+@@ -33,36 +32,128 @@
+             "states": states,
+         }
+ 
++
++class EventBusClosed(RuntimeError):
++    """Raised when a closed event bus has no pending events left to deliver."""
++
++
+ class CoalescingEventBus:
+-    """A bounded event queue which drops stale work but preserves latest state."""
++    """Bounded keyed latest-state delivery for accepted market-state updates.
++
++    Capacity is measured in distinct pending state keys, not raw updates. A
++    newer accepted update for a key which is already pending replaces the
++    pending payload in-place. A new distinct key never evicts an unrelated
++    key: when the bus is at capacity its publisher waits until the consumer
++    frees a slot.
++
++    ``RollingStateStore`` remains the authoritative state layer. It is
++    updated before an event enters the pending delivery set, so coalescing
++    affects analyzer work only; it never rolls the latest state backwards.
++    """
+ 
+     def __init__(self, store: RollingStateStore, *, capacity: int) -> None:
+         if capacity <= 0:
+             raise ValueError("event bus capacity must be positive")
+         self.store = store
+-        self._queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=capacity)
+         self.capacity = capacity
++        self._pending_latest: dict[str, MarketEvent] = {}
++        self._pending_order: deque[str] = deque()
++        self._condition = asyncio.Condition()
++        self._closed = False
++        self.accepted_events = 0
++        self.coalesced_updates = 0
++        self.queue_high_watermark = 0
++        self.publisher_backpressure_waits = 0
++        # Retained for status-schema compatibility. Keyed delivery does not
++        # arbitrarily drop accepted events, so this counter must remain zero.
+         self.dropped_events = 0
+         self.rejected_state_events = 0
++
+     async def publish(self, event: MarketEvent) -> None:
+         if not self.store.add(event):
+             self.rejected_state_events += 1
+             return
+-        if self._queue.full():
+-            with contextlib.suppress(asyncio.QueueEmpty):
+-                self._queue.get_nowait()
+-                self.dropped_events += 1
+-        with contextlib.suppress(asyncio.QueueFull):
+-            self._queue.put_nowait(event)
++        self.accepted_events += 1
++
++        waited_for_capacity = False
++        async with self._condition:
++            while True:
++                if self._closed:
++                    # Shutdown may race with a source which has already placed
++                    # the update in the authoritative state store. Do not
++                    # block shutdown merely to enqueue analyzer work.
++                    return
++
++                # More than one publisher for the same key may have called
++                # store.add() before acquiring this condition. Only the
++                # event which is still authoritative may alter pending work;
++                # otherwise an older publisher could overwrite a newer one.
++                if self.store.latest(event.key) is not event:
++                    return
++
++                if event.key in self._pending_latest:
++                    self._pending_latest[event.key] = event
++                    self.coalesced_updates += 1
++                    return
++
++                if len(self._pending_latest) < self.capacity:
++                    self._pending_latest[event.key] = event
++                    self._pending_order.append(event.key)
++                    self.queue_high_watermark = max(
++                        self.queue_high_watermark,
++                        len(self._pending_latest),
++                    )
++                    # Wake a consumer waiting for the first pending key.
++                    self._condition.notify(1)
++                    return
++
++                if not waited_for_capacity:
++                    self.publisher_backpressure_waits += 1
++                    waited_for_capacity = True
++                # Condition.wait() releases the lock while blocked. A
++                # consumer calls notify_all() after freeing distinct-key
++                # capacity, and close() also wakes blocked publishers.
++                await self._condition.wait()
+ 
+     async def next_event(self) -> MarketEvent:
+-        return await self._queue.get()
++        async with self._condition:
++            while not self._pending_order:
++                if self._closed:
++                    raise EventBusClosed("event bus is closed")
++                await self._condition.wait()
++
++            key = self._pending_order.popleft()
++            event = self._pending_latest.pop(key)
++            # All capacity waiters are woken because multiple waiters can be
++            # competing for different keys, or older same-key publishers can
++            # discover that a newer accepted update superseded them.
++            self._condition.notify_all()
++            return event
++
++    async def close(self) -> None:
++        """Stop accepting pending work and wake blocked producers/consumers."""
++
++        async with self._condition:
++            self._closed = True
++            self._condition.notify_all()
++
+     def snapshot(self) -> dict[str, Any]:
++        pending_keys = len(self._pending_latest)
+         return {
++            # Existing fields are intentionally retained for consumers of the
++            # current status schema.
+             "capacity": self.capacity,
+-            "queued": self._queue.qsize(),
++            "queued": pending_keys,
+             "dropped_events": self.dropped_events,
+             "rejected_state_events": self.rejected_state_events,
++            # Explicit keyed-coalescing metrics.
++            "accepted_events": self.accepted_events,
++            "coalesced_updates": self.coalesced_updates,
++            "pending_keys": pending_keys,
++            "queue_capacity": self.capacity,
++            "queue_high_watermark": self.queue_high_watermark,
++            "publisher_backpressure_waits": self.publisher_backpressure_waits,
++            "closed": self._closed,
+         }
+ 
+ 
+@@ -86,7 +177,10 @@
+             retry_delay = retry_initial_seconds
+     async def _event_consumer(self) -> None:
+         while not self._stop_event.is_set():
+-            event = await self._bus.next_event()
++            try:
++                event = await self._bus.next_event()
++            except EventBusClosed:
++                return
+             if self.event_handler is not None:
+                 try:
+                     await self.event_handler(event)
+@@ -112,7 +206,8 @@
+                 "history_minimum_interval_ms": self.history_minimum_interval_ms,
+                 "policy": (
+                     "latest state plus a bounded in-memory rolling window; "
+-                    "live bus receives every update"
++                    "accepted state updates use keyed latest-state coalescing; "
++                    "distinct-key saturation applies bounded backpressure"
+                 ),
+             },
+             "event_bus": self._bus.snapshot(),
+@@ -135,6 +230,7 @@
+             final_error = f"{type(exc).__name__}: {exc}"
+         finally:
+             self._stop_event.set()
++            await self._bus.close()
+             for handler in self.shutdown_handlers:
+                 try:
+                     await handler()
+diff --git a/tests/test_realtime_scanner.py b/tests/test_realtime_scanner.py
+--- a/tests/test_realtime_scanner.py
++++ b/tests/test_realtime_scanner.py
+@@ -8,6 +8,7 @@
+ from typing import Any
+ from unittest.mock import patch
+ 
++from market_data_lab.realtime_scanner import CoalescingEventBus
+ from market_data_lab.realtime_scanner import MarketEvent
+ from market_data_lab.realtime_scanner import RealtimeScanner
+ from market_data_lab.realtime_scanner import RollingStateStore
+@@ -29,6 +30,130 @@
+         self.assertEqual(observed_timeouts, [1.0, 2.0, 2.0])
+         self.assertEqual(scanner.snapshot(status="running")["sources"][source.name]["restarts"], 3)
+ 
++
++class CoalescingEventBusTest(unittest.IsolatedAsyncioTestCase):
++    @staticmethod
++    def _store() -> RollingStateStore:
++        return RollingStateStore(
++            retention_seconds=60,
++            max_events_per_key=8,
++            boot_id="boot-a",
++        )
++
++    @staticmethod
++    def _event(key: str, sequence: int) -> MarketEvent:
++        return MarketEvent(
++            source="feed",
++            key=key,
++            kind="quote",
++            value=sequence,
++            summary={"sequence": sequence},
++            received_realtime_ns=sequence,
++            received_monotonic_ns=sequence,
++            chain_position=sequence,
++            event_id=f"{key}:{sequence}",
++            source_epoch=1,
++            boot_id="boot-a",
++        )
++
++    async def _wait_for_backpressure(self, bus: CoalescingEventBus) -> None:
++        for _ in range(20):
++            if bus.snapshot()["publisher_backpressure_waits"]:
++                return
++            await asyncio.sleep(0)
++        self.fail("publisher did not enter bounded backpressure")
++
++    async def test_hot_key_coalesces_to_latest_without_growing_queue(self) -> None:
++        bus = CoalescingEventBus(self._store(), capacity=4)
++
++        for sequence in range(1, 1_001):
++            await bus.publish(self._event("A", sequence))
++
++        snapshot = bus.snapshot()
++        self.assertEqual(snapshot["accepted_events"], 1_000)
++        self.assertEqual(snapshot["pending_keys"], 1)
++        self.assertEqual(snapshot["queued"], 1)
++        self.assertEqual(snapshot["queue_high_watermark"], 1)
++        self.assertEqual(snapshot["coalesced_updates"], 999)
++        self.assertEqual(snapshot["dropped_events"], 0)
++
++        delivered = await bus.next_event()
++        self.assertEqual(delivered.key, "A")
++        self.assertEqual(delivered.value, 1_000)
++        self.assertEqual(bus.snapshot()["pending_keys"], 0)
++
++    async def test_distinct_key_waits_for_capacity_instead_of_evicting(self) -> None:
++        bus = CoalescingEventBus(self._store(), capacity=2)
++        await bus.publish(self._event("A", 1))
++        await bus.publish(self._event("B", 1))
++
++        blocked = asyncio.create_task(bus.publish(self._event("C", 1)))
++        await self._wait_for_backpressure(bus)
++        self.assertFalse(blocked.done())
++        self.assertEqual(bus.snapshot()["pending_keys"], 2)
++        self.assertEqual(bus.snapshot()["dropped_events"], 0)
++
++        first = await bus.next_event()
++        self.assertEqual(first.key, "A")
++        await asyncio.wait_for(blocked, timeout=0.5)
++
++        second = await bus.next_event()
++        third = await bus.next_event()
++        self.assertEqual([second.key, third.key], ["B", "C"])
++        self.assertEqual(bus.snapshot()["publisher_backpressure_waits"], 1)
++        self.assertEqual(bus.snapshot()["queue_high_watermark"], 2)
++
++    async def test_hot_key_cannot_evict_single_cold_key(self) -> None:
++        bus = CoalescingEventBus(self._store(), capacity=2)
++        await bus.publish(self._event("B", 1))
++
++        for sequence in range(1, 1_001):
++            await bus.publish(self._event("A", sequence))
++
++        snapshot = bus.snapshot()
++        self.assertEqual(snapshot["pending_keys"], 2)
++        self.assertEqual(snapshot["dropped_events"], 0)
++        self.assertEqual(snapshot["coalesced_updates"], 999)
++
++        cold = await bus.next_event()
++        hot = await bus.next_event()
++        self.assertEqual(cold.key, "B")
++        self.assertEqual(hot.key, "A")
++        self.assertEqual(hot.value, 1_000)
++
++    async def test_rejected_state_event_never_enters_pending_bus(self) -> None:
++        bus = CoalescingEventBus(self._store(), capacity=2)
++        accepted = self._event("A", 2)
++        rejected = self._event("A", 1)
++
++        await bus.publish(accepted)
++        await bus.publish(rejected)
++
++        snapshot = bus.snapshot()
++        self.assertEqual(snapshot["accepted_events"], 1)
++        self.assertEqual(snapshot["rejected_state_events"], 1)
++        self.assertEqual(snapshot["pending_keys"], 1)
++        self.assertEqual((await bus.next_event()).value, 2)
++
++        with self.assertRaises(TimeoutError):
++            await asyncio.wait_for(bus.next_event(), timeout=0.01)
++
++    async def test_close_wakes_publisher_waiting_for_distinct_key_capacity(self) -> None:
++        bus = CoalescingEventBus(self._store(), capacity=1)
++        await bus.publish(self._event("A", 1))
++
++        blocked = asyncio.create_task(bus.publish(self._event("B", 1)))
++        await self._wait_for_backpressure(bus)
++        self.assertFalse(blocked.done())
++
++        await bus.close()
++        await asyncio.wait_for(blocked, timeout=0.5)
++        snapshot = bus.snapshot()
++        self.assertTrue(snapshot["closed"])
++        self.assertEqual(snapshot["pending_keys"], 1)
++        self.assertEqual(snapshot["dropped_events"], 0)
++
++
+ class RollingStateStoreTest(unittest.TestCase):
+     def test_history_can_coalesce_without_delaying_latest_state(self) -> None:
+         store = RollingStateStore(

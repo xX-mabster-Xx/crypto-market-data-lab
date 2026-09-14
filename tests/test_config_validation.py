@@ -61,6 +61,10 @@ class PositiveIntValidationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             _positive_int({"x": 1.9}, "x", 1)
 
+    def test_rejects_fractional_decimal(self) -> None:
+        with self.assertRaises(ValueError):
+            _positive_int({"x": Decimal("1.9")}, "x", 1)
+
     def test_rejects_fractional_string(self) -> None:
         with self.assertRaises(ValueError):
             _positive_int({"x": "1.9"}, "x", 1)
@@ -105,6 +109,10 @@ class NonNegativeIntValidationTest(unittest.TestCase):
     def test_rejects_fractional_float(self) -> None:
         with self.assertRaises(ValueError):
             _non_negative_int({"x": 1.9}, "x", 0)
+
+    def test_rejects_fractional_decimal(self) -> None:
+        with self.assertRaises(ValueError):
+            _non_negative_int({"x": Decimal("1.9")}, "x", 0)
 
     def test_rejects_bool(self) -> None:
         with self.assertRaises(ValueError):

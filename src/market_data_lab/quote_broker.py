@@ -741,8 +741,10 @@ class QuoteBroker:
 
         existing = self._inflight.get(request.key)
         if existing is not None:
-            self._counts["inflight_joins"] += 1
-            return await self._deliver(existing, request, served_from="inflight_shared")
+            if not existing.done():
+                self._counts["inflight_joins"] += 1
+                return await self._deliver(existing, request, served_from="inflight_shared")
+            self._remove_inflight(request.key, existing)
 
         if request.key.provider not in self._backends:
             self._counts["unsupported"] += 1
@@ -980,8 +982,10 @@ class QuoteBroker:
             )
         existing = self._local_inflight.get(request.key)
         if existing is not None:
-            self._counts["simulation_inflight_joins"] += 1
-            return await self._deliver(existing, request, served_from="local_inflight_shared")
+            if not existing.done():
+                self._counts["simulation_inflight_joins"] += 1
+                return await self._deliver(existing, request, served_from="local_inflight_shared")
+            self._remove_local_inflight(request.key, existing)
         backend = self._local_backends.get(request.key.provider)
         if backend is None:
             self._counts["simulation_unsupported"] += 1

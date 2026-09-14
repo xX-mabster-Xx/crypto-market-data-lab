@@ -84,7 +84,7 @@ from market_data_lab.triangle_cycle_monitor import (  # noqa: E402
     build_triangle_providers,
     record_triangle_cycle_monitor,
 )
-from market_data_lab.unified_market_data import record_unified_market_data  # noqa: E402
+from market_data_lab.unified_market_data import build_unified_market_data_scanner  # noqa: E402
 
 
 LOCAL_CONFIG = PROJECT_ROOT / "config" / "solana-rpc.local.toml"
@@ -977,7 +977,10 @@ async def run_scanner(*, duration_seconds: float | None) -> Path:
     local_config = replace(
         local_config,
         raydium_local_quote_worker=replace(local_config.raydium_local_quote_worker, enabled=True),
-        local_route_evaluator=replace(local_config.local_route_evaluator, enabled=True),
+        local_route_evaluator=replace(
+            local_config.local_route_evaluator,
+            enabled=bool(local_config.local_route_evaluator.routes),
+        ),
     )
     direct_markets = tuple(MARKETS.values())
     triangle_markets = tuple(TRIANGLE_MARKETS)
@@ -1019,6 +1022,12 @@ async def run_scanner(*, duration_seconds: float | None) -> Path:
         name: ComponentState(name)
         for name in ("market_data",)
     }
+    preview_market_data_scanner = build_unified_market_data_scanner(
+        config=local_config,
+        output_directory=run_root / "market_data",
+        hyperliquid_coins=DEFAULT_HYPERLIQUID_COINS,
+    )
+    runtime_components = dict(preview_market_data_scanner.runtime_components)
 
     coverage = {
         "cex_public_book_streams": [
@@ -1062,9 +1071,22 @@ async def run_scanner(*, duration_seconds: float | None) -> Path:
         "hot_orca_pools": len(local_config.orca_pools),
         "hot_orca_pool_labels": [pool.label for pool in local_config.orca_pools],
         "hot_orca_discovery_error": orca_discovery_error,
-        "hot_local_routes": len(local_config.local_route_evaluator.routes),
+        "hot_local_routes": runtime_components["local_route_count"],
+        **runtime_components,
         "hot_pool_state_snapshot_refresh_interval_ms": (
             local_config.raydium_local_quote_worker.state_snapshot_refresh_interval_ms
+        ),
+        "hot_pool_core_refresh_after_ms": (
+            local_config.raydium_local_quote_worker.core_refresh_after_ms
+        ),
+        "hot_pool_maintenance_scan_interval_ms": (
+            local_config.raydium_local_quote_worker.maintenance_scan_interval_ms
+        ),
+        "hot_pool_refresh_stagger_window_ms": (
+            local_config.raydium_local_quote_worker.refresh_stagger_window_ms
+        ),
+        "hot_pool_state_emit_min_interval_ms": (
+            local_config.raydium_local_quote_worker.pool_state_emit_min_interval_ms
         ),
         "hot_pool_state_maximum_age_ms": (
             local_config.local_route_evaluator.maximum_pool_state_age_ms
@@ -1076,7 +1098,9 @@ async def run_scanner(*, duration_seconds: float | None) -> Path:
             local_config.raydium_local_quote_worker.tick_cache_max_age_ms
         ),
         "hot_local_route_ids": [
-            route.route_id for route in local_config.local_route_evaluator.routes
+            route.route_id
+            for route in local_config.local_route_evaluator.routes
+            if runtime_components["local_route_evaluator_attached"]
         ],
         "not_yet_implemented": list(NOT_YET_IMPLEMENTED),
     }
@@ -1117,6 +1141,16 @@ async def run_scanner(*, duration_seconds: float | None) -> Path:
         "solana_pool_state_snapshot_refresh_interval_ms": (
             local_config.raydium_local_quote_worker.state_snapshot_refresh_interval_ms
         ),
+        "solana_pool_refresh_policy": "stale_driven_deterministically_staggered",
+        "solana_pool_core_refresh_after_ms": (
+            local_config.raydium_local_quote_worker.core_refresh_after_ms
+        ),
+        "solana_pool_maintenance_scan_interval_ms": (
+            local_config.raydium_local_quote_worker.maintenance_scan_interval_ms
+        ),
+        "solana_pool_state_emit_min_interval_ms": (
+            local_config.raydium_local_quote_worker.pool_state_emit_min_interval_ms
+        ),
         "solana_rpc_http_min_request_interval_ms": (
             local_config.raydium_local_quote_worker.rpc_http_min_request_interval_ms
         ),
@@ -1136,6 +1170,7 @@ async def run_scanner(*, duration_seconds: float | None) -> Path:
         "mode": "one_command_all_market_scanner",
         "config_file": str(LOCAL_CONFIG),
         "coverage": coverage,
+        "runtime_components": runtime_components,
         "rate_budgets": rate_budgets,
         "retention": retention,
         "api_credentials": {
@@ -1165,12 +1200,16 @@ async def run_scanner(*, duration_seconds: float | None) -> Path:
         # One venue-neutral bus for CEX spot, local Solana pool state, and
         # public perp DEX books/context.  Its attached analyzer consumes this
         # state only; it opens no additional market-data connections.
-        return await record_unified_market_data(
-            config=local_config,
-            output_directory=directory,
-            duration_seconds=None,
-            hyperliquid_coins=DEFAULT_HYPERLIQUID_COINS,
+        scanner = (
+            preview_market_data_scanner
+            if directory == preview_market_data_scanner.output_directory
+            else build_unified_market_data_scanner(
+                config=local_config,
+                output_directory=directory,
+                hyperliquid_coins=DEFAULT_HYPERLIQUID_COINS,
+            )
         )
+        return await scanner.run(duration_seconds=None)
 
     async def run_direct(directory: Path) -> dict[str, Any]:
         # Avoid opening two identical broad CEX subscription sets in the same
@@ -1331,6 +1370,7 @@ async def run_scanner(*, duration_seconds: float | None) -> Path:
                         3,
                     ),
                     "coverage": coverage,
+                    "runtime_components": runtime_components,
                     "rate_budgets": rate_budgets,
                     "retention": retention,
                     "components": {name: state.snapshot() for name, state in states.items()},
@@ -1402,6 +1442,7 @@ async def run_scanner(*, duration_seconds: float | None) -> Path:
             "duration_wall_seconds": round(time.monotonic() - started_monotonic, 3),
             "stop_reason": stop_reason,
             "coverage": coverage,
+            "runtime_components": runtime_components,
             "rate_budgets": rate_budgets,
             "retention": retention,
             "components": final_components,

@@ -245,13 +245,16 @@ def build_triangle_providers(
     raydium_min_request_interval_seconds: float,
     stonfi_slippage_tolerance: Decimal,
     raydium_request_pacer: AsyncRequestPacer | None = None,
+    evm_request_pacer: AsyncRequestPacer | Mapping[str, AsyncRequestPacer] | None = None,
+    stonfi_request_pacer: AsyncRequestPacer | None = None,
+    evm_min_request_interval_seconds: float = 0.6,
+    stonfi_min_request_interval_seconds: float = 0.6,
 ) -> dict[str, DexQuoteProvider]:
     """Create one DEX quote provider per pair without multiplying a quota.
 
-    Raydium instances share one request-start pacer; therefore 78 workers do
-    not create 78 independent public-API budgets.  STON.fi and the public RPCs
-    are separately gated by the runner because their provider objects have no
-    native shared pacer.
+    Every provider family receives one shared request-start pacer.  Pacing is
+    performed at the provider's actual HTTP/RPC/WS request boundary, so a
+    logical buy/sell round cannot bypass the advertised quota interval.
     """
 
     configured_evm = evm_markets(
@@ -262,6 +265,20 @@ def build_triangle_providers(
     raydium_pacer = raydium_request_pacer or AsyncRequestPacer(
         raydium_min_request_interval_seconds,
     )
+    if evm_request_pacer is None:
+        evm_request_pacer = {
+            "base": AsyncRequestPacer(evm_min_request_interval_seconds),
+            "polygon": AsyncRequestPacer(evm_min_request_interval_seconds),
+        }
+    stonfi_request_pacer = stonfi_request_pacer or AsyncRequestPacer(
+        stonfi_min_request_interval_seconds,
+    )
+
+    def evm_pacer_for(chain: str) -> AsyncRequestPacer | None:
+        if isinstance(evm_request_pacer, Mapping):
+            return evm_request_pacer.get(chain)
+        return evm_request_pacer
+
     providers: dict[str, DexQuoteProvider] = {}
     for market in markets:
         if market.provider in providers:
@@ -284,6 +301,7 @@ def build_triangle_providers(
                 proxy_url=proxy_url,
                 timeout_seconds=timeout_seconds,
                 slippage_tolerance=stonfi_slippage_tolerance,
+                request_pacer=stonfi_request_pacer,
             )
         elif market.provider_kind in {"uniswap_base", "uniswap_polygon"}:
             source = (
@@ -300,6 +318,7 @@ def build_triangle_providers(
                 ),
                 proxy_url=proxy_url,
                 timeout_seconds=timeout_seconds,
+                request_pacer=evm_pacer_for(source.chain),
             )
         else:
             raise ValueError(f"unsupported triangle provider kind: {market.provider_kind}")
@@ -1082,11 +1101,13 @@ async def record_triangle_cycle_monitor(
         provider = providers[market.provider]
         gate_key = _provider_gate_key(market)
         gate = quote_gates.get(gate_key) if gate_key else None
+        request_pacer = getattr(provider, "request_pacer", None)
+        pacing = None if isinstance(request_pacer, AsyncRequestPacer) else gate
         round_id = 0
         consecutive_terminal_route_misses = 0
         while not stop_event.is_set():
-            if gate is not None:
-                await gate.wait()
+            if pacing is not None:
+                await pacing.wait()
             try:
                 records = await provider.quote_round(round_id, [input_amount])
             except asyncio.CancelledError:
@@ -1172,8 +1193,8 @@ async def record_triangle_cycle_monitor(
             stats.last_cex_update_at = datetime.now(UTC).isoformat()
             for market in markets_by_venue_symbol.get((venue, book.symbol), ()):
                 for record in tuple(cache_by_market[market.name].values()):
-                    received_ns = int(record.get("response_received_realtime_ns", 0))
-                    if time.time_ns() - received_ns > cache_age_ns:
+                    received_ns = int(record.get("response_received_monotonic_ns", 0))
+                    if time.monotonic_ns() - received_ns > cache_age_ns:
                         continue
                     evaluate(
                         output,

@@ -651,6 +651,16 @@ RTT, лучший положительный edge и lifecycle кандидат�
 строк; без positive screen этот файл вообще не создаётся. Все книги, pool
 updates и промежуточные quote results остаются только в RAM.
 
+Общий rolling store хранит только компактный CEX top-of-book. Полная глубина
+остаётся в bounded latest-state resolver соответствующего CEX source вместе с
+`source_epoch` и event provenance; при reconnect она инвалидируется до первого
+события новой session. Поля `runtime_components.local_route_evaluator_requested`,
+`local_route_evaluator_attached`, `local_route_count` и
+`local_quote_worker_attached` в manifest/status отражают фактическую композицию,
+а не только намерение конфигурации. Если evaluator запрошен, но worker или
+нужные CEX depth subscriptions нельзя подключить, запуск завершается fail-fast
+до открытия market-data subscriptions.
+
 Комиссия из примера MEXC — лишь публичный baseline. Чтобы пометить маршрут
 account-verified, отдельно создай read-only audit без торговых прав и укажи
 созданный компактный файл как `local_route_evaluator.fee_audit_file`; scanner
