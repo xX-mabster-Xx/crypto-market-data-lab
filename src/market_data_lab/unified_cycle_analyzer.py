@@ -38,6 +38,7 @@ from market_data_lab.cex_dex_cycles import CycleMarket
 from market_data_lab.cex_dex_cycles import calculate_cycle
 from market_data_lab.cex_dex_cycles import market_for_cex
 from market_data_lab.live_common import atomic_json
+from market_data_lab.numeric_text import canonical_decimal_text
 from market_data_lab.polling_quote_sources import ExactInputQuote
 from market_data_lab.realtime_scanner import MarketEvent
 from market_data_lab.rolling_cycle_monitor import DEFAULT_CEX_TAKER_FEES
@@ -77,8 +78,10 @@ class _ActiveCandidate:
     key: str
     analysis_kind: str
     started_realtime_ns: int
+    started_monotonic_ns: int
     started_at: str
     last_seen_realtime_ns: int
+    last_seen_monotonic_ns: int
     last_seen_at: str
     observations: int
     max_edge_bps: Decimal
@@ -165,6 +168,83 @@ class UnifiedCycleAnalyzer:
                 self._triangle_by_book[(venue, cex_symbol(market.base, venue))].add(provider)
                 self._triangle_by_book[(venue, cex_symbol(market.quote, venue))].add(provider)
 
+    def handle_source_epoch_change(self, source: str, old_epoch: int, new_epoch: int) -> None:
+        """Purge all cached evidence from the old source epoch."""
+        self._purge_source_epoch(source, old_epoch)
+
+    def _remove_quote_key(self, key: tuple[str, str, str]) -> bool:
+        """Remove a quote key from primary cache and all secondary indexes.
+
+        Returns True if the key was present and removed.
+        """
+        provider = key[0]
+        if key in self._direct_quotes:
+            self._direct_quotes.pop(key, None)
+            self._quote_keys_by_direct_provider[provider].discard(key)
+            self._dirty_direct.difference_update(
+                {(pk, ps, d, v) for pk, ps, d, v in self._dirty_direct if (pk, ps, d) == key}
+            )
+            return True
+        if key in self._triangle_quotes:
+            self._triangle_quotes.pop(key, None)
+            self._quote_keys_by_triangle_provider[provider].discard(key)
+            self._dirty_triangle.difference_update(
+                {(pk, ps, d, v) for pk, ps, d, v in self._dirty_triangle if (pk, ps, d) == key}
+            )
+            return True
+        return False
+
+    def _purge_provider(self, provider: str) -> int:
+        """Remove all quotes for a single provider from both caches and indexes."""
+        removed = 0
+        for key in list(self._quote_keys_by_direct_provider.get(provider, set())):
+            if self._remove_quote_key(key):
+                removed += 1
+        for key in list(self._quote_keys_by_triangle_provider.get(provider, set())):
+            if self._remove_quote_key(key):
+                removed += 1
+        self._quote_keys_by_direct_provider.pop(provider, None)
+        self._quote_keys_by_triangle_provider.pop(provider, None)
+        return removed
+
+    def _purge_source_epoch(self, source: str, old_epoch: int) -> int:
+        """Purge quotes belonging to a source epoch that no longer owns them."""
+        invalidated = 0
+        for key in list(self._direct_quotes.keys()):
+            quote = self._direct_quotes.get(key)
+            if quote is not None and quote.source_epoch <= old_epoch:
+                if self._remove_quote_key(key):
+                    invalidated += 1
+        for key in list(self._triangle_quotes.keys()):
+            quote = self._triangle_quotes.get(key)
+            if quote is not None and quote.source_epoch <= old_epoch:
+                if self._remove_quote_key(key):
+                    invalidated += 1
+        self._dirty_direct.clear()
+        self._dirty_triangle.clear()
+        self._active.clear()
+        self._counts["epoch_invalidated_quotes"] += invalidated
+        return invalidated
+
+    def _prune_expired_quotes(self, now_monotonic_ns: int) -> int:
+        """Physically remove quotes older than the freshness TTL."""
+        freshness_ns = int(self.max_response_skew_ms * Decimal(1_000_000))
+        cutoff = now_monotonic_ns - freshness_ns
+        pruned = 0
+        for key in list(self._direct_quotes.keys()):
+            quote = self._direct_quotes.get(key)
+            if quote is not None and quote.response_received_monotonic_ns < cutoff:
+                if self._remove_quote_key(key):
+                    pruned += 1
+        for key in list(self._triangle_quotes.keys()):
+            quote = self._triangle_quotes.get(key)
+            if quote is not None and quote.response_received_monotonic_ns < cutoff:
+                if self._remove_quote_key(key):
+                    pruned += 1
+        if pruned:
+            self._counts["stale_quote_prunes"] += pruned
+        return pruned
+
     @staticmethod
     def _load_fee_audit(
         fee_audit_file: Path | None,
@@ -232,18 +312,18 @@ class UnifiedCycleAnalyzer:
         }
 
     def _quote_key(self, quote: ExactInputQuote) -> tuple[str, str, str] | None:
-        notional = _notional_key(quote.requested_notional_quote)
-        if notional is None or quote.direction not in {"buy_base", "sell_base"}:
+        slot_id = quote.quote_slot_id
+        if not slot_id or quote.direction not in {"buy_base", "sell_base"}:
             return None
-        return quote.provider, notional, quote.direction
+        return quote.provider, slot_id, quote.direction
 
     def _schedule_direct(self, quote_key: tuple[str, str, str], venue: str) -> None:
-        provider, notional, direction = quote_key
-        self._dirty_direct.add((provider, notional, direction, venue))
+        provider, slot_id, direction = quote_key
+        self._dirty_direct.add((provider, slot_id, direction, venue))
 
     def _schedule_triangle(self, quote_key: tuple[str, str, str], venue: str) -> None:
-        provider, notional, direction = quote_key
-        self._dirty_triangle.add((provider, notional, direction, venue))
+        provider, slot_id, direction = quote_key
+        self._dirty_triangle.add((provider, slot_id, direction, venue))
 
     def _ensure_worker(self) -> None:
         if self._worker_task is None:
@@ -257,6 +337,9 @@ class UnifiedCycleAnalyzer:
         self._ensure_worker()
         self._counts["events_seen"] += 1
         if event.kind == "exact_input_quote" and isinstance(event.value, ExactInputQuote):
+            if event.value.source_epoch < event.source_epoch:
+                self._counts["old_epoch_quotes_rejected"] += 1
+                return
             quote = (
                 event.value
                 if event.value.source_epoch == event.source_epoch
@@ -322,6 +405,7 @@ class UnifiedCycleAnalyzer:
                 try:
                     await self._drain_dirty()
                     self._close_stale_candidates()
+                    self._prune_expired_quotes(time.monotonic_ns())
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -340,10 +424,10 @@ class UnifiedCycleAnalyzer:
         triangle_jobs = tuple(self._dirty_triangle)[:512]
         self._dirty_direct.difference_update(direct_jobs)
         self._dirty_triangle.difference_update(triangle_jobs)
-        for provider, notional, direction, venue in direct_jobs:
-            self._evaluate_direct((provider, notional, direction), venue)
-        for provider, notional, direction, venue in triangle_jobs:
-            self._evaluate_triangle((provider, notional, direction), venue)
+        for provider, slot_id, direction, venue in direct_jobs:
+            self._evaluate_direct((provider, slot_id, direction), venue)
+        for provider, slot_id, direction, venue in triangle_jobs:
+            self._evaluate_triangle((provider, slot_id, direction), venue)
         if self._dirty_direct or self._dirty_triangle:
             self._wake.set()
         # Let source and consumer tasks run after a sizeable calculation batch.
@@ -378,7 +462,7 @@ class UnifiedCycleAnalyzer:
         }
 
     def _evaluate_direct(self, key: tuple[str, str, str], venue: str) -> None:
-        provider, _, _ = key
+        provider, _slot_id, _direction = key
         market = self._direct_markets.get(provider)
         quote = self._direct_quotes.get(key)
         source = self._spot_cex_sources.get(venue)
@@ -396,6 +480,7 @@ class UnifiedCycleAnalyzer:
                 ),
                 analysis_kind="direct_inventory",
                 observed_realtime_ns=quote.response_received_realtime_ns,
+                observed_monotonic_ns=quote.response_received_monotonic_ns,
             )
             return
         cex_market = market_for_cex(market, venue)
@@ -412,6 +497,7 @@ class UnifiedCycleAnalyzer:
                 ),
                 analysis_kind="direct_inventory",
                 observed_realtime_ns=quote.response_received_realtime_ns,
+                observed_monotonic_ns=quote.response_received_monotonic_ns,
             )
             return
         try:
@@ -450,6 +536,7 @@ class UnifiedCycleAnalyzer:
             cycle,
             analysis_kind="direct_inventory",
             observed_realtime_ns=max(quote.response_received_realtime_ns, book.response.received_realtime_ns),
+            observed_monotonic_ns=max(quote.response_received_monotonic_ns, book.response.received_monotonic_ns),
         )
 
     def _triangle_unavailable_cycle(
@@ -483,7 +570,7 @@ class UnifiedCycleAnalyzer:
         }
 
     def _evaluate_triangle(self, key: tuple[str, str, str], venue: str) -> None:
-        provider, _, _ = key
+        provider, _slot_id, _direction = key
         market = self._triangle_markets.get(provider)
         quote = self._triangle_quotes.get(key)
         source = self._spot_cex_sources.get(venue)
@@ -501,6 +588,7 @@ class UnifiedCycleAnalyzer:
                 ),
                 analysis_kind="cex_dex_cex_triangle",
                 observed_realtime_ns=quote.response_received_realtime_ns,
+                observed_monotonic_ns=quote.response_received_monotonic_ns,
             )
             return
         base_symbol = cex_symbol(market.base, venue)
@@ -520,6 +608,7 @@ class UnifiedCycleAnalyzer:
                 ),
                 analysis_kind="cex_dex_cex_triangle",
                 observed_realtime_ns=quote.response_received_realtime_ns,
+                observed_monotonic_ns=quote.response_received_monotonic_ns,
             )
             return
         try:
@@ -586,6 +675,11 @@ class UnifiedCycleAnalyzer:
                 base_book.response.received_realtime_ns,
                 quote_book.response.received_realtime_ns,
             ),
+            observed_monotonic_ns=max(
+                quote.response_received_monotonic_ns,
+                base_book.response.received_monotonic_ns,
+                quote_book.response.received_monotonic_ns,
+            ),
         )
 
     @staticmethod
@@ -629,6 +723,7 @@ class UnifiedCycleAnalyzer:
         state: _ActiveCandidate,
         *,
         observed_realtime_ns: int,
+        observed_monotonic_ns: int,
         current_cycle: Mapping[str, Any] | None = None,
         close_reason: str | None = None,
     ) -> dict[str, Any]:
@@ -643,7 +738,7 @@ class UnifiedCycleAnalyzer:
             "last_seen_at": state.last_seen_at,
             "event_at": _utc_iso_from_ns(observed_realtime_ns),
             "duration_seconds": round(
-                max(0, observed_realtime_ns - state.started_realtime_ns) / 1_000_000_000,
+                max(0, observed_monotonic_ns - state.started_monotonic_ns) / 1_000_000_000,
                 6,
             ),
             "positive_observations": state.observations,
@@ -692,12 +787,14 @@ class UnifiedCycleAnalyzer:
         *,
         analysis_kind: str,
         observed_realtime_ns: int,
+        observed_monotonic_ns: int,
     ) -> None:
         key = self._cycle_key(cycle, analysis_kind)
         current = self._active.get(key)
         if not self._is_modelled_candidate(cycle):
             if current is not None:
                 current.last_seen_realtime_ns = observed_realtime_ns
+                current.last_seen_monotonic_ns = observed_monotonic_ns
                 current.last_seen_at = _utc_iso_from_ns(observed_realtime_ns)
                 self._active.pop(key)
                 self._candidate_closed += 1
@@ -706,6 +803,7 @@ class UnifiedCycleAnalyzer:
                         "candidate_closed",
                         current,
                         observed_realtime_ns=observed_realtime_ns,
+                        observed_monotonic_ns=observed_monotonic_ns,
                         current_cycle=cycle,
                         close_reason="not_positive_or_timing_invalid",
                     ),
@@ -718,8 +816,10 @@ class UnifiedCycleAnalyzer:
                 key=key,
                 analysis_kind=analysis_kind,
                 started_realtime_ns=observed_realtime_ns,
+                started_monotonic_ns=observed_monotonic_ns,
                 started_at=_utc_iso_from_ns(observed_realtime_ns),
                 last_seen_realtime_ns=observed_realtime_ns,
+                last_seen_monotonic_ns=observed_monotonic_ns,
                 last_seen_at=_utc_iso_from_ns(observed_realtime_ns),
                 observations=1,
                 max_edge_bps=edge,
@@ -733,11 +833,13 @@ class UnifiedCycleAnalyzer:
                     "candidate_started",
                     current,
                     observed_realtime_ns=observed_realtime_ns,
+                    observed_monotonic_ns=observed_monotonic_ns,
                     current_cycle=cycle,
                 ),
             )
             return
         current.last_seen_realtime_ns = observed_realtime_ns
+        current.last_seen_monotonic_ns = observed_monotonic_ns
         current.last_seen_at = _utc_iso_from_ns(observed_realtime_ns)
         current.observations += 1
         if edge > current.max_edge_bps:
@@ -750,6 +852,7 @@ class UnifiedCycleAnalyzer:
                     "candidate_improved",
                     current,
                     observed_realtime_ns=observed_realtime_ns,
+                    observed_monotonic_ns=observed_monotonic_ns,
                     current_cycle=cycle,
                 ),
             )
@@ -762,6 +865,7 @@ class UnifiedCycleAnalyzer:
         *,
         analysis_kind: str,
         observed_realtime_ns: int,
+        observed_monotonic_ns: int,
     ) -> None:
         self._counts[f"{analysis_kind}_evaluations"] += 1
         self._counts["cycle_evaluations"] += 1
@@ -812,13 +916,15 @@ class UnifiedCycleAnalyzer:
             cycle,
             analysis_kind=analysis_kind,
             observed_realtime_ns=observed_realtime_ns,
+            observed_monotonic_ns=observed_monotonic_ns,
         )
 
     def _close_stale_candidates(self) -> None:
-        now = time.time_ns()
+        now_realtime_ns = time.time_ns()
+        now_monotonic_ns = time.monotonic_ns()
         max_idle_ns = int(self.max_response_skew_ms * Decimal(1_000_000))
         for key, state in tuple(self._active.items()):
-            if now - state.last_seen_realtime_ns <= max_idle_ns:
+            if now_monotonic_ns - state.last_seen_monotonic_ns <= max_idle_ns:
                 continue
             self._active.pop(key)
             self._candidate_closed += 1
@@ -826,7 +932,8 @@ class UnifiedCycleAnalyzer:
                 self._candidate_event(
                     "candidate_closed",
                     state,
-                    observed_realtime_ns=now,
+                    observed_realtime_ns=now_realtime_ns,
+                    observed_monotonic_ns=now_monotonic_ns,
                     close_reason="no_fresh_timing_valid_evaluation",
                 ),
             )
@@ -870,13 +977,48 @@ class UnifiedCycleAnalyzer:
                 "fee_audit_load_error": self._fee_audit_error,
             },
             "counts": dict(sorted(self._counts.items())),
-            "candidate_lifecycle": {
-                "started": self._candidate_started,
-                "improved": self._candidate_improved,
-                "closed": self._candidate_closed,
-                "active": len(self._active),
+           "candidate_lifecycle": {
+               "started": self._candidate_started,
+               "improved": self._candidate_improved,
+               "closed": self._candidate_closed,
+               "active": len(self._active),
+           },
+            "observability": {
+                "received_events": self._counts.get("events_seen", 0),
+                "accepted_events": (
+                    self._counts.get("direct_quote_events", 0)
+                    + self._counts.get("triangle_quote_events", 0)
+                    + self._counts.get("cex_book_events", 0)
+                ),
+                "rejected_state_events": (
+                    self._counts.get("old_epoch_quotes_rejected", 0)
+                    + self._counts.get("unmapped_exact_quote_events", 0)
+                    + self._counts.get("malformed_exact_quote_events", 0)
+                ),
+                "coalesced_updates": (
+                    self._counts.get("direct_quote_events", 0)
+                    + self._counts.get("triangle_quote_events", 0)
+                ),
+                "pending_keys": len(self._direct_quotes) + len(self._triangle_quotes),
+                "queue_high_watermark": self._counts.get("queue_high_watermark", 0),
+                "publisher_backpressure_waits": self._counts.get("publisher_backpressure_waits", 0),
+                "state_key_count": (
+                    len(self._direct_quotes) + len(self._triangle_quotes)
+                    + sum(len(v) for v in self._quote_keys_by_direct_provider.values())
+                    + sum(len(v) for v in self._quote_keys_by_triangle_provider.values())
+                ),
+                "state_key_retirements": (
+                    self._counts.get("stale_quote_prunes", 0)
+                    + self._counts.get("epoch_invalidated_quotes", 0)
+                ),
+                "source_epoch": self._counts.get("source_epoch", 0),
+                "source_restarts": self._counts.get("source_restarts", 0),
+                "last_accepted_event_age_ms": None,
+                "last_error": (
+                    self._recent_errors[-1] if self._recent_errors else None
+                ),
             },
-            "route_count": len(self._route_stats),
+           "route_count": len(self._route_stats),
             "top_routes": top_routes,
             "top_routes_policy": "timing_valid_only; timing-invalid edges are excluded",
             "recent_calculation_errors": list(self._recent_errors),
@@ -909,6 +1051,7 @@ class UnifiedCycleAnalyzer:
                     "candidate_closed",
                     state,
                     observed_realtime_ns=now,
+                    observed_monotonic_ns=time.monotonic_ns(),
                     close_reason="scanner_shutdown",
                 ),
             )

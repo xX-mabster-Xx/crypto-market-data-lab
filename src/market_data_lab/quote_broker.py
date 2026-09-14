@@ -650,11 +650,13 @@ class QuoteBroker:
     async def _execute(self, request: QuoteRequest) -> QuoteResult:
         backend = self._backends.get(request.key.provider)
         if backend is None:
-            return self._failure(request, "unsupported", "quote_provider_backend_unavailable")
+            failure = self._failure(request, "unsupported", "quote_provider_backend_unavailable")
+            self.observe_result(failure)
+            return failure
         try:
             result = await backend(request)
             if result.key != request.key:
-                return self._failure(request, "provider_error", "quote_backend_key_mismatch")
+                result = self._failure(request, "provider_error", "quote_backend_key_mismatch")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -996,7 +998,7 @@ class QuoteBroker:
         try:
             result = await backend(request)
             if result.key != request.key:
-                return self._failure(request, "provider_error", "local_backend_key_mismatch")
+                result = self._failure(request, "provider_error", "local_backend_key_mismatch")
         except asyncio.CancelledError:
             raise
         except Exception as exc:

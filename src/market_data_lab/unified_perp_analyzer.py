@@ -50,6 +50,7 @@ from market_data_lab.funding_model import FundingProjection
 from market_data_lab.funding_model import project_common_rate_discrete_funding
 from market_data_lab.live_common import atomic_json
 from market_data_lab.perp_venue_feeds import PerpQuoteEvent
+from market_data_lab.numeric_text import canonical_decimal_text
 from market_data_lab.polling_quote_sources import ExactInputQuote
 from market_data_lab.quantity_lattice import round_down_to_common_quantity_lattice
 from market_data_lab.realtime_scanner import MarketEvent
@@ -88,7 +89,9 @@ STRATEGY_FAMILIES = (
 
 
 def _decimal_text(value: Decimal | None) -> str | None:
-    return format(value, "f") if value is not None else None
+    if value is None:
+        return None
+    return canonical_decimal_text(value)
 
 
 def _utc_iso_from_ns(value: int) -> str:
@@ -200,8 +203,10 @@ class _ActiveCandidate:
     key: str
     analysis_kind: str
     started_realtime_ns: int
+    started_monotonic_ns: int
     started_at: str
     last_seen_realtime_ns: int
+    last_seen_monotonic_ns: int
     last_seen_at: str
     observations: int
     max_edge_bps: Decimal
@@ -703,6 +708,83 @@ class UnifiedPerpAnalyzer:
         )
         self._counts["linear_perp_book_or_context_events"] += 1
 
+    def handle_source_epoch_change(self, source: str, old_epoch: int, new_epoch: int) -> None:
+        """Purge all cached DEX quotes from the old source epoch."""
+        self._purge_dex_source_epoch(source, old_epoch)
+
+    def _remove_dex_quote_key(self, key: tuple[str, str, str]) -> bool:
+        """Remove a DEX quote key from primary cache and all secondary indexes."""
+        provider, _slot_id, _direction = key
+        if key in self._dex_quotes:
+            self._dex_quotes.pop(key, None)
+            for base_set in self._dex_keys_by_base.values():
+                base_set.discard(key)
+            self._capabilities_dirty = True
+            return True
+        return False
+
+    def _purge_dex_provider(self, provider: str) -> int:
+        """Remove all DEX quotes for a single provider."""
+        removed = 0
+        keys_to_remove = [
+            key for key in self._dex_keys_by_base.get(provider.upper(), set())
+            if key in self._dex_quotes
+        ]
+        # Also check all base sets since provider isn't the dict key
+        all_provider_keys = [key for key in self._dex_quotes if key[0] == provider]
+        for key in all_provider_keys:
+            if self._remove_dex_quote_key(key):
+                removed += 1
+        for base in list(self._dex_keys_by_base):
+            self._dex_keys_by_base[base].difference_update(
+                key for key in all_provider_keys
+            )
+            if not self._dex_keys_by_base[base]:
+                self._dex_keys_by_base.pop(base, None)
+        if removed:
+            self._capabilities_dirty = True
+        return removed
+
+    def _purge_dex_source_epoch(self, source: str, old_epoch: int) -> int:
+        """Purge DEX quotes belonging to a source epoch that no longer owns them."""
+        invalidated = 0
+        for key in list(self._dex_quotes.keys()):
+            quote = self._dex_quotes.get(key)
+            if quote is not None and quote.source_epoch <= old_epoch:
+                if self._remove_dex_quote_key(key):
+                    invalidated += 1
+        if invalidated:
+            for base in list(self._dex_keys_by_base):
+                empty = all(
+                    key not in self._dex_quotes for key in self._dex_keys_by_base.get(base, set())
+                )
+                if empty:
+                    self._dex_keys_by_base.pop(base, None)
+            self._capabilities_dirty = True
+        self._counts["epoch_invalidated_dex_quotes"] += invalidated
+        return invalidated
+
+    def _prune_expired_dex_quotes(self, now_monotonic_ns: int) -> int:
+        """Physically remove DEX quotes older than the freshness TTL."""
+        freshness_ns = int(self.max_response_skew_ms * Decimal(1_000_000))
+        cutoff = now_monotonic_ns - freshness_ns
+        pruned = 0
+        for key in list(self._dex_quotes.keys()):
+            quote = self._dex_quotes.get(key)
+            if quote is not None and quote.response_received_monotonic_ns < cutoff:
+                if self._remove_dex_quote_key(key):
+                    pruned += 1
+        if pruned:
+            for base in list(self._dex_keys_by_base):
+                empty = all(
+                    key not in self._dex_quotes for key in self._dex_keys_by_base.get(base, set())
+                )
+                if empty:
+                    self._dex_keys_by_base.pop(base, None)
+            self._capabilities_dirty = True
+            self._counts["stale_dex_prunes"] += pruned
+        return pruned
+
     def _update_exact_quote(self, value: ExactInputQuote) -> None:
         market = self._direct_markets.get(value.provider)
         if market is None:
@@ -717,12 +799,15 @@ class UnifiedPerpAnalyzer:
         ):
             self._counts["malformed_exact_quote_events"] += 1
             return
-        notional_key = _decimal_text(value.requested_notional_quote)
-        if notional_key is None:
+        slot_id = value.quote_slot_id
+        if not slot_id:
             self._counts["malformed_exact_quote_events"] += 1
             return
-        key = value.provider, notional_key, value.direction
+        key = value.provider, slot_id, value.direction
         previous = self._dex_quotes.get(key)
+        if previous is not None and value.source_epoch < previous.source_epoch:
+            self._counts["old_epoch_exacts_ignored"] += 1
+            return
         if previous is not None and quote_received_before(value, previous):
             self._counts["exact_quote_out_of_order_ignored"] += 1
             return
@@ -1172,6 +1257,7 @@ class UnifiedPerpAnalyzer:
                     if self._dirty_bases:
                         self._wake.set()
                     self._close_stale_candidates()
+                    self._prune_expired_dex_quotes(time.monotonic_ns())
                     await asyncio.sleep(0)
                 except asyncio.CancelledError:
                     raise
@@ -1364,6 +1450,7 @@ class UnifiedPerpAnalyzer:
                 observed_realtime_ns=now_ns,
             ),
             observed_realtime_ns=now_ns,
+            observed_monotonic_ns=now_monotonic_ns,
         )
 
     def _evaluate_perp_pair(
@@ -1483,6 +1570,7 @@ class UnifiedPerpAnalyzer:
                 observed_realtime_ns=now_ns,
             ),
             observed_realtime_ns=now_ns,
+            observed_monotonic_ns=now_monotonic_ns,
         )
         long_funding, long_funding_detail = self._funding_projection(
             perp=long_perp,
@@ -1544,6 +1632,7 @@ class UnifiedPerpAnalyzer:
                 observed_realtime_ns=now_ns,
             ),
             observed_realtime_ns=now_ns,
+            observed_monotonic_ns=now_monotonic_ns,
         )
 
     def _evaluate_spot_perp(
@@ -1690,6 +1779,7 @@ class UnifiedPerpAnalyzer:
                 observed_realtime_ns=now_ns,
             ),
             observed_realtime_ns=now_ns,
+            observed_monotonic_ns=now_monotonic_ns,
         )
         if (
             funding.normalized_cashflow_per_hour is None
@@ -1714,6 +1804,7 @@ class UnifiedPerpAnalyzer:
                 observed_realtime_ns=now_ns,
             ),
             observed_realtime_ns=now_ns,
+            observed_monotonic_ns=now_monotonic_ns,
         )
 
     def _evaluate_dex_perp(
@@ -1953,6 +2044,7 @@ class UnifiedPerpAnalyzer:
                 observed_realtime_ns=now_ns,
             ),
             observed_realtime_ns=now_ns,
+            observed_monotonic_ns=now_monotonic_ns,
         )
 
     def _evaluate_dex_perp_paired_exact_quote(
@@ -2102,6 +2194,7 @@ class UnifiedPerpAnalyzer:
                 observed_realtime_ns=now_ns,
             ),
             observed_realtime_ns=now_ns,
+            observed_monotonic_ns=now_monotonic_ns,
         )
         if (
             funding.normalized_cashflow_per_hour is None
@@ -2127,6 +2220,7 @@ class UnifiedPerpAnalyzer:
                 observed_realtime_ns=now_ns,
             ),
             observed_realtime_ns=now_ns,
+            observed_monotonic_ns=now_monotonic_ns,
         )
 
     def _evaluate_dex_perp_sequential(
@@ -2319,6 +2413,7 @@ class UnifiedPerpAnalyzer:
                 observed_realtime_ns=now_ns,
             ),
             observed_realtime_ns=now_ns,
+            observed_monotonic_ns=now_monotonic_ns,
         )
 
     def _make_cycle(
@@ -2553,6 +2648,7 @@ class UnifiedPerpAnalyzer:
         state: _ActiveCandidate,
         *,
         observed_realtime_ns: int,
+        observed_monotonic_ns: int,
         current_cycle: Mapping[str, Any] | None = None,
         close_reason: str | None = None,
     ) -> dict[str, Any]:
@@ -2567,7 +2663,7 @@ class UnifiedPerpAnalyzer:
             "last_seen_at": state.last_seen_at,
             "event_at": _utc_iso_from_ns(observed_realtime_ns),
             "duration_seconds": round(
-                max(0, observed_realtime_ns - state.started_realtime_ns) / 1_000_000_000,
+                max(0, observed_monotonic_ns - state.started_monotonic_ns) / 1_000_000_000,
                 6,
             ),
             "positive_observations": state.observations,
@@ -2797,7 +2893,7 @@ class UnifiedPerpAnalyzer:
     def _report_candidate_console(self, event: Mapping[str, Any]) -> None:
         if event["event"] in {"candidate_started", "candidate_improved"}:
             candidate_key = str(event["candidate_key"])
-            observed_ns = time.time_ns()
+            observed_ns = time.monotonic_ns()
             last_report_ns = self._last_console_candidate_report_ns.get(candidate_key)
             if (
                 last_report_ns is not None
@@ -2822,12 +2918,14 @@ class UnifiedPerpAnalyzer:
         *,
         analysis_kind: str,
         observed_realtime_ns: int,
+        observed_monotonic_ns: int,
     ) -> None:
         key = self._cycle_key(cycle, analysis_kind)
         current = self._active.get(key)
         if not self._is_modelled_candidate(cycle):
             if current is not None:
                 current.last_seen_realtime_ns = observed_realtime_ns
+                current.last_seen_monotonic_ns = observed_monotonic_ns
                 current.last_seen_at = _utc_iso_from_ns(observed_realtime_ns)
                 self._active.pop(key)
                 self._candidate_closed += 1
@@ -2837,6 +2935,7 @@ class UnifiedPerpAnalyzer:
                             "candidate_closed",
                             current,
                             observed_realtime_ns=observed_realtime_ns,
+                            observed_monotonic_ns=observed_monotonic_ns,
                             current_cycle=cycle,
                             close_reason="not_positive_not_eligible_or_timing_invalid",
                         ),
@@ -2853,8 +2952,10 @@ class UnifiedPerpAnalyzer:
                 key=key,
                 analysis_kind=analysis_kind,
                 started_realtime_ns=observed_realtime_ns,
+                started_monotonic_ns=observed_monotonic_ns,
                 started_at=_utc_iso_from_ns(observed_realtime_ns),
                 last_seen_realtime_ns=observed_realtime_ns,
+                last_seen_monotonic_ns=observed_monotonic_ns,
                 last_seen_at=_utc_iso_from_ns(observed_realtime_ns),
                 observations=1,
                 max_edge_bps=edge,
@@ -2870,6 +2971,7 @@ class UnifiedPerpAnalyzer:
                         "candidate_started",
                         current,
                         observed_realtime_ns=observed_realtime_ns,
+                        observed_monotonic_ns=observed_monotonic_ns,
                         current_cycle=cycle,
                     ),
                 )
@@ -2877,6 +2979,7 @@ class UnifiedPerpAnalyzer:
                 self._counts["candidate_pending_started"] += 1
             return
         current.last_seen_realtime_ns = observed_realtime_ns
+        current.last_seen_monotonic_ns = observed_monotonic_ns
         current.last_seen_at = _utc_iso_from_ns(observed_realtime_ns)
         current.observations += 1
         improved = edge > current.max_edge_bps
@@ -2889,7 +2992,7 @@ class UnifiedPerpAnalyzer:
             current.max_pnl_usdt = max(current.max_pnl_usdt, pnl)
 
         if not current.persisted:
-            if observed_realtime_ns - current.started_realtime_ns < self._candidate_min_persistence_ns:
+            if observed_monotonic_ns - current.started_monotonic_ns < self._candidate_min_persistence_ns:
                 self._counts["candidate_pending_observations"] += 1
                 return
             current.persisted = True
@@ -2899,6 +3002,7 @@ class UnifiedPerpAnalyzer:
                     "candidate_started",
                     current,
                     observed_realtime_ns=observed_realtime_ns,
+                    observed_monotonic_ns=observed_monotonic_ns,
                     current_cycle=cycle,
                 ),
             )
@@ -2909,11 +3013,12 @@ class UnifiedPerpAnalyzer:
                     "candidate_improved",
                     current,
                     observed_realtime_ns=observed_realtime_ns,
+                    observed_monotonic_ns=observed_monotonic_ns,
                     current_cycle=cycle,
                 ),
             )
 
-    def _observe_cycle(self, cycle: dict[str, Any], *, observed_realtime_ns: int) -> None:
+    def _observe_cycle(self, cycle: dict[str, Any], *, observed_realtime_ns: int, observed_monotonic_ns: int) -> None:
         analysis_kind = str(cycle["analysis_kind"])
         self._counts["strategy_evaluations"] += 1
         self._counts[f"{analysis_kind}_evaluations"] += 1
@@ -2978,10 +3083,12 @@ class UnifiedPerpAnalyzer:
             cycle,
             analysis_kind=analysis_kind,
             observed_realtime_ns=observed_realtime_ns,
+            observed_monotonic_ns=observed_monotonic_ns,
         )
 
     def _close_stale_candidates(self) -> None:
-        now = time.time_ns()
+        now_realtime_ns = time.time_ns()
+        now_monotonic_ns = time.monotonic_ns()
         # A route with no new evaluation cannot remain active longer than the
         # strictest universal BBO freshness budget, even if its last observed
         # receive skew happened to be wider.
@@ -2990,7 +3097,7 @@ class UnifiedPerpAnalyzer:
             * Decimal(1_000_000)
         )
         for key, state in tuple(self._active.items()):
-            if now - state.last_seen_realtime_ns <= max_idle_ns:
+            if now_monotonic_ns - state.last_seen_monotonic_ns <= max_idle_ns:
                 continue
             self._active.pop(key)
             self._candidate_closed += 1
@@ -2999,7 +3106,8 @@ class UnifiedPerpAnalyzer:
                     self._candidate_event(
                         "candidate_closed",
                         state,
-                        observed_realtime_ns=now,
+                        observed_realtime_ns=now_realtime_ns,
+                        observed_monotonic_ns=now_monotonic_ns,
                         close_reason="no_fresh_timing_valid_evaluation",
                     ),
                 )
@@ -3121,13 +3229,39 @@ class UnifiedPerpAnalyzer:
                 "unsupported_perp_contract_states": unsupported_contract_states,
             },
             "counts": dict(sorted(self._counts.items())),
-            "candidate_lifecycle": {
-                "started": self._candidate_started,
-                "improved": self._candidate_improved,
-                "closed": self._candidate_closed,
-                "active": len(self._active),
-                "persisted_active": sum(state.persisted for state in self._active.values()),
-                "pending_active": sum(not state.persisted for state in self._active.values()),
+           "candidate_lifecycle": {
+               "started": self._candidate_started,
+               "improved": self._candidate_improved,
+               "closed": self._candidate_closed,
+               "active": len(self._active),
+               "persisted_active": sum(state.persisted for state in self._active.values()),
+               "pending_active": sum(not state.persisted for state in self._active.values()),
+           },
+            "observability": {
+                "received_events": self._counts.get("events_seen", 0),
+                "accepted_events": (
+                    self._counts.get("dex_quote_events", 0)
+                    + self._counts.get("perp_book_events", 0)
+                    + self._counts.get("linear_book_events", 0)
+                ),
+                "rejected_state_events": (
+                    self._counts.get("old_epoch_exacts_ignored", 0)
+                    + self._counts.get("malformed_exact_quote_events", 0)
+                    + self._counts.get("malformed_perp_events", 0)
+                    + self._counts.get("unmapped_spot_book_events", 0)
+                ),
+                "pending_keys": len(self._dex_quotes),
+                "state_key_count": (
+                    len(self._dex_quotes)
+                    + sum(len(v) for v in self._dex_keys_by_base.values())
+                ),
+                "state_key_retirements": (
+                    self._counts.get("stale_dex_prunes", 0)
+                    + self._counts.get("epoch_invalidated_dex_quotes", 0)
+                ),
+                "last_error": (
+                    self._recent_errors[-1] if self._recent_errors else None
+                ),
             },
             "route_count": len(self._route_stats),
             "top_routes": top_routes,
@@ -3161,6 +3295,7 @@ class UnifiedPerpAnalyzer:
             except asyncio.CancelledError:
                 pass
         now = time.time_ns()
+        now_monotonic_ns = time.monotonic_ns()
         for key, state in tuple(self._active.items()):
             self._active.pop(key)
             self._candidate_closed += 1
@@ -3170,6 +3305,7 @@ class UnifiedPerpAnalyzer:
                         "candidate_closed",
                         state,
                         observed_realtime_ns=now,
+                        observed_monotonic_ns=now_monotonic_ns,
                         close_reason="scanner_shutdown",
                     ),
                 )

@@ -98,6 +98,8 @@ class SourceHealth:
     starts: int = 0
     restarts: int = 0
     updates: int = 0
+    received_events: int = 0
+    rejected_events: int = 0
     first_event_monotonic_ns: int | None = None
     last_event_realtime_ns: int | None = None
     last_event_monotonic_ns: int | None = None
@@ -112,7 +114,10 @@ class SourceHealth:
         self.last_error = bounded
         self._recent_errors.append(bounded)
 
-    def observe(self, event: MarketEvent) -> None:
+    def observe_received(self, event: MarketEvent) -> None:
+        self.received_events += 1
+
+    def observe_accepted(self, event: MarketEvent) -> None:
         if self.last_event_monotonic_ns is not None:
             self._interarrival_ms.append(
                 max(0.0, (event.received_monotonic_ns - self.last_event_monotonic_ns) / 1_000_000),
@@ -152,6 +157,8 @@ class SourceHealth:
             "starts": self.starts,
             "restarts": self.restarts,
             "updates": self.updates,
+            "received_events": self.received_events,
+            "rejected_events": self.rejected_events,
             "update_rate_per_second": (
                 round(update_rate_per_second, 3) if update_rate_per_second is not None else None
             ),
@@ -191,10 +198,13 @@ class RollingStateStore:
         retention_seconds: float,
         max_events_per_key: int,
         history_minimum_interval_ms: float = 0,
+        max_state_keys: int = 65536,
         boot_id: str | None = None,
     ) -> None:
         if retention_seconds <= 0 or max_events_per_key <= 0 or history_minimum_interval_ms < 0:
             raise ValueError("state-store retention, capacity, and interval must be valid")
+        if max_state_keys <= 0:
+            raise ValueError("max_state_keys must be positive")
         self.retention_ns = int(retention_seconds * 1_000_000_000)
         self.history_minimum_interval_ns = int(history_minimum_interval_ms * 1_000_000)
         self.max_events_per_key = max_events_per_key
@@ -202,11 +212,15 @@ class RollingStateStore:
         self._versioned = VersionedMarketState(boot_id=self.boot_id)
         self._history: dict[str, deque[MarketEvent]] = {}
         self._latest: dict[str, MarketEvent] = {}
+        self.max_state_keys = max_state_keys
         self._total_updates = 0
         self._discarded_by_retention = 0
         self._coalesced_by_interval = 0
         self._rejected_out_of_order = 0
         self._invalidated_by_source_epoch = 0
+        self._capacity_evictions = 0
+        self._last_sweep_monotonic_ns = 0
+        self._sweep_interval_ns = int(retention_seconds * 1_000_000_000 // 10)
 
     @property
     def total_updates(self) -> int:
@@ -274,6 +288,46 @@ class RollingStateStore:
     def recent(self, key: str) -> tuple[MarketEvent, ...]:
         return tuple(self._history.get(key, ()))
 
+    @property
+    def capacity_evictions(self) -> int:
+        return self._capacity_evictions
+
+    def sweep(self, *, now_monotonic_ns: int | None = None) -> tuple[str, ...]:
+        """Retire state keys idle longer than retention and enforce hard key cap."""
+
+        if now_monotonic_ns is None:
+            now_monotonic_ns = time.monotonic_ns()
+        if now_monotonic_ns - self._last_sweep_monotonic_ns < self._sweep_interval_ns:
+            return ()
+        self._last_sweep_monotonic_ns = now_monotonic_ns
+        retired: list[str] = []
+        cutoff_ns = now_monotonic_ns - self.retention_ns
+        for key in tuple(self._latest):
+            latest = self._latest.get(key)
+            if latest is None:
+                continue
+            if latest.received_monotonic_ns < cutoff_ns:
+                if self._versioned.retire(latest.instrument_or_pool_id or key):
+                    retired.append(key)
+                self._latest.pop(key, None)
+                self._history.pop(key, None)
+                self._invalidated_by_source_epoch += 1
+        # Enforce hard key capacity by evicting oldest idle keys.
+        if len(self._latest) > self.max_state_keys:
+            sorted_keys = sorted(
+                self._latest,
+                key=lambda k: self._latest[k].received_monotonic_ns,
+            )
+            for key in sorted_keys[: len(self._latest) - self.max_state_keys]:
+                latest = self._latest.get(key)
+                if latest is not None:
+                    self._versioned.retire(latest.instrument_or_pool_id or key)
+                self._latest.pop(key, None)
+                self._history.pop(key, None)
+                self._capacity_evictions += 1
+                retired.append(key)
+        return tuple(retired)
+
     def snapshot(self, *, now_monotonic_ns: int, limit: int = 256) -> dict[str, Any]:
         states: dict[str, Any] = {}
         # This is diagnostic output, not a full market-data export.  Stable
@@ -309,44 +363,92 @@ class RollingStateStore:
             "coalesced_by_interval": self._coalesced_by_interval,
             "rejected_out_of_order_or_duplicate": self._rejected_out_of_order,
             "invalidated_by_source_epoch": self._invalidated_by_source_epoch,
+            "capacity_evictions": self._capacity_evictions,
+            "max_state_keys": self.max_state_keys,
             "history_minimum_interval_ms": self.history_minimum_interval_ns / 1_000_000,
             "displayed_keys": len(states),
             "states": states,
         }
 
 
+@dataclass(frozen=True, slots=True)
+class PublishResult:
+    """Outcome of an event publication attempt."""
+
+    accepted: bool
+    coalesced: bool = False
+
+
 class CoalescingEventBus:
-    """A bounded event queue which drops stale work but preserves latest state."""
+    """A bounded event queue which coalesces by state key with backpressure.
+
+    Distinct pending keys are bounded by capacity.  A duplicate pending
+    key replaces the queued payload and increments coalesced_updates.
+    When the bus is saturated, new distinct keys apply bounded backpressure
+    (the publisher awaits) rather than dropping arbitrary events.
+    """
 
     def __init__(self, store: RollingStateStore, *, capacity: int) -> None:
         if capacity <= 0:
             raise ValueError("event bus capacity must be positive")
         self.store = store
-        self._queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=capacity)
         self.capacity = capacity
+        self._pending_latest: dict[str, MarketEvent] = {}
+        self._pending_order: deque[str] = deque()
+        self._condition = asyncio.Condition()
         self.dropped_events = 0
         self.rejected_state_events = 0
+        self.coalesced_updates = 0
+        self.pending_keys = 0
+        self.queue_high_watermark = 0
+        self.publisher_backpressure_waits = 0
 
-    async def publish(self, event: MarketEvent) -> None:
-        if not self.store.add(event):
+    @property
+    def queued(self) -> int:
+        return len(self._pending_latest)
+
+    async def publish(self, event: MarketEvent) -> PublishResult:
+        accepted = self.store.add(event)
+        if not accepted:
             self.rejected_state_events += 1
-            return
-        if self._queue.full():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self._queue.get_nowait()
-                self.dropped_events += 1
-        with contextlib.suppress(asyncio.QueueFull):
-            self._queue.put_nowait(event)
+            return PublishResult(accepted=False)
+        async with self._condition:
+            if event.key in self._pending_latest:
+                self._pending_latest[event.key] = event
+                self.coalesced_updates += 1
+                self._condition.notify_all()
+                return PublishResult(accepted=True, coalesced=True)
+            while len(self._pending_latest) >= self.capacity:
+                self.publisher_backpressure_waits += 1
+                await self._condition.wait()
+            self._pending_latest[event.key] = event
+            self._pending_order.append(event.key)
+            self.pending_keys = len(self._pending_latest)
+            self.queue_high_watermark = max(self.queue_high_watermark, self.pending_keys)
+            self._condition.notify_all()
+            return PublishResult(accepted=True)
 
     async def next_event(self) -> MarketEvent:
-        return await self._queue.get()
+        async with self._condition:
+            while not self._pending_latest:
+                await self._condition.wait()
+            key = self._pending_order.popleft()
+            event = self._pending_latest.pop(key)
+            self._condition.notify_all()
+            return event
 
     def snapshot(self) -> dict[str, Any]:
         return {
             "capacity": self.capacity,
-            "queued": self._queue.qsize(),
-            "dropped_events": self.dropped_events,
+            "queued": self.queued,
+            "accepted_events": self.store.total_updates,
             "rejected_state_events": self.rejected_state_events,
+            "coalesced_updates": self.coalesced_updates,
+            "pending_keys": self.pending_keys,
+            "queue_capacity": self.capacity,
+            "queue_high_watermark": self.queue_high_watermark,
+            "publisher_backpressure_waits": self.publisher_backpressure_waits,
+            "dropped_events": self.dropped_events,
         }
 
 
@@ -386,10 +488,13 @@ class RealtimeScanner:
     max_events_per_key: int = 4_096
     history_minimum_interval_ms: float = 0
     event_bus_capacity: int = 8_192
+    max_state_keys: int = 65536
     status_flush_seconds: float = 2.0
     event_handler: EventHandler | None = None
     status_providers: Mapping[str, StatusProvider] = field(default_factory=dict)
     shutdown_handlers: Sequence[ShutdownHandler] = ()
+    epoch_change_handlers: Sequence[Callable[[str, int, int], None]] = ()
+    supervisor_stable_run_reset_after_seconds: float = 30.0
     _store: RollingStateStore = field(init=False, repr=False)
     _bus: CoalescingEventBus = field(init=False, repr=False)
     _health: dict[str, SourceHealth] = field(init=False, repr=False)
@@ -404,6 +509,8 @@ class RealtimeScanner:
             raise ValueError("scanner source names must be non-empty and unique")
         if self.status_flush_seconds <= 0:
             raise ValueError("status_flush_seconds must be positive")
+        if not math.isfinite(self.supervisor_stable_run_reset_after_seconds) or self.supervisor_stable_run_reset_after_seconds <= 0:
+            raise ValueError("supervisor_stable_run_reset_after_seconds must be finite and positive")
         if any(not isinstance(name, str) or not name.strip() for name in self.status_providers):
             raise ValueError("status provider names must be non-empty strings")
         self._boot_id = _current_boot_id()
@@ -411,6 +518,7 @@ class RealtimeScanner:
             retention_seconds=self.retention_seconds,
             max_events_per_key=self.max_events_per_key,
             history_minimum_interval_ms=self.history_minimum_interval_ms,
+            max_state_keys=self.max_state_keys,
             boot_id=self._boot_id,
         )
         self._bus = CoalescingEventBus(self._store, capacity=self.event_bus_capacity)
@@ -427,12 +535,17 @@ class RealtimeScanner:
     def stop_event(self) -> asyncio.Event:
         return self._stop_event
 
-    async def _publish(self, event: MarketEvent) -> None:
+    async def _publish(self, event: MarketEvent) -> PublishResult:
         health = self._health.get(event.source)
         if health is None:
             raise ValueError(f"event references unknown source {event.source!r}")
-        health.observe(event)
-        await self._bus.publish(event)
+        health.observe_received(event)
+        result = await self._bus.publish(event)
+        if result.accepted:
+            health.observe_accepted(event)
+        else:
+            health.rejected_events += 1
+        return result
 
     async def _source_supervisor(self, source: ScannerSource) -> None:
         health = self._health[source.name]
@@ -450,11 +563,16 @@ class RealtimeScanner:
             ),
         )
         retry_delay = retry_initial_seconds
+        run_started_monotonic = time.monotonic()
         while not self._stop_event.is_set():
             health.starts += 1
+            old_epoch = health.source_epoch
             health.source_epoch += 1
             source_epoch = health.source_epoch
             self._store.advance_source_epoch(source.name, source_epoch)
+            for handler in self.epoch_change_handlers:
+                handler(source.name, old_epoch, source_epoch)
+            epoch_started_monotonic = time.monotonic()
             event_counter = 0
 
             async def publish_for_epoch(event: MarketEvent) -> None:
@@ -484,6 +602,11 @@ class RealtimeScanner:
                 health.running = False
                 health.restarts += 1
                 health.record_error(f"{type(exc).__name__}: {exc}")
+                # Reset backoff if the source ran stably for a while before
+                # this failure; a single event followed by a crash should
+                # still escalate.
+                if time.monotonic() - epoch_started_monotonic >= self.supervisor_stable_run_reset_after_seconds:
+                    retry_delay = retry_initial_seconds
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=retry_delay)
                 except TimeoutError:
@@ -491,10 +614,12 @@ class RealtimeScanner:
                 continue
             finally:
                 health.running = False
+            # Successful return (normally only on shutdown) resets backoff.
             retry_delay = retry_initial_seconds
 
     async def _event_consumer(self) -> None:
         while not self._stop_event.is_set():
+            self._store.sweep(now_monotonic_ns=time.monotonic_ns())
             event = await self._bus.next_event()
             if self.event_handler is not None:
                 try:
@@ -523,8 +648,10 @@ class RealtimeScanner:
                 "max_events_per_key": self.max_events_per_key,
                 "history_minimum_interval_ms": self.history_minimum_interval_ms,
                 "policy": (
-                    "latest state plus a bounded in-memory rolling window; "
-                    "live bus receives every update"
+                    "accepted state updates use keyed latest-state coalescing: "
+                    "superseded pending updates of the same state key are replaced; "
+                    "distinct-key saturation applies bounded backpressure rather than "
+                    "arbitrary dropping; idle keys are retired by TTL sweep"
                 ),
             },
             "event_bus": self._bus.snapshot(),
@@ -553,6 +680,8 @@ class RealtimeScanner:
     async def _status_writer(self) -> None:
         path = self.output_directory / "status.json"
         while not self._stop_event.is_set():
+            now_monotonic_ns = time.monotonic_ns()
+            self._store.sweep(now_monotonic_ns=now_monotonic_ns)
             atomic_json(path, self.snapshot(status="running"))
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self.status_flush_seconds)

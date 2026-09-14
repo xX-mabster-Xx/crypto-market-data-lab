@@ -54,7 +54,7 @@ EVM Uniswap, TON/STОN.fi, Omniston, Jupiter/Raydium aggregator split routes, RF
 
 ## 3. Проверенное состояние репозитория
 
-Аудит исходников и локальная регрессия выполнены 11.09.2026. Python: `>=3.12,<3.15`; Node: `>=22`; TypeScript strict/NodeNext/ES2022. Текущие проверки: 181 Python-тест прошёл; `npm run check` и `npm test` worker прошли. Это baseline, который исполнитель повторяет на своей исходной ревизии.
+Аудит исходников и локальная регрессия выполнены 11.09.2026. Python: `>=3.12,<3.15`; Node: `>=24 <25`; TypeScript strict/NodeNext/ES2022. Текущие проверки: 181 Python-тест прошёл; `npm run check` и `npm test` worker прошли. Это baseline, который исполнитель повторяет на своей исходной ревизии.
 
 Версии из `workers/solana-quote-worker/package-lock.json`: Raydium SDK `0.2.63-alpha`, Orca SDK `0.22.0`, Meteora DLMM `1.9.14`, Solana web3.js `1.98.4`. В package.json есть `latest`; установка/обновление не должна незаметно сменить lockfile. Локальный SDK и актуальный upstream могут различаться; подтверждать конкретную пару SDK/program semantics.
 

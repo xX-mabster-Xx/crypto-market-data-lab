@@ -130,6 +130,18 @@ class ShardedPublicBookStream:
             self._updates.put_nowait(update)
 
     async def next_update(self) -> BookSnapshot:
+        # If the receiver task has exited (e.g. transport failure), propagate
+        # the error to the caller instead of blocking forever on the queue.
+        # This lets the outer supervisor own reconnection and epoch transitions.
+        if self._receiver is not None and self._receiver.done():
+            exc = self._receiver.exception()
+            if exc is not None:
+                if isinstance(exc, asyncio.CancelledError):
+                    raise exc
+                raise RuntimeError(
+                    f"{self.venue} websocket transport failed: {exc}",
+                ) from exc
+            raise RuntimeError(f"{self.venue} websocket receiver exited unexpectedly")
         return await self._updates.get()
 
     def nearest_snapshot(self, symbol: str, target_realtime_ns: int) -> BookSnapshot | None:
@@ -326,50 +338,54 @@ class _EventedBookStream:
             raise RuntimeError(f"{self.venue} websocket startup failed: {detail}") from None
 
     async def _supervise(self) -> None:
-        delay_seconds = 0.25
-        while not self._stopping:
-            websocket: Any = None
-            heartbeat: asyncio.Task[None] | None = None
-            try:
-                websocket = await self.connect_websocket(
-                    self.endpoint,
-                    open_timeout=self.timeout_seconds,
-                    close_timeout=1,
-                    ping_interval=self.websocket_ping_interval,
-                    ping_timeout=20,
-                    proxy=self.proxy_url,
-                )
-                self._websocket = websocket
-                await self._subscribe(websocket)
-                if (
-                    self.application_heartbeat_interval_seconds is not None
-                    and self.application_heartbeat_payload is not None
-                ):
-                    heartbeat = asyncio.create_task(self._send_application_heartbeats(websocket))
-                delay_seconds = 0.25
-                while not self._stopping:
-                    raw = await websocket.recv()
-                    if raw is None:
-                        raise ConnectionError("websocket closed by peer")
-                    self._handle_raw(raw)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if not self._stopping:
-                    self._error = f"{type(exc).__name__}: {exc}"
-                    self._reconnects += 1
-                    await asyncio.sleep(delay_seconds)
-                    delay_seconds = min(delay_seconds * 2, 10.0)
-            finally:
-                if heartbeat is not None:
-                    heartbeat.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await heartbeat
-                if websocket is not None:
-                    with contextlib.suppress(Exception):
-                        await websocket.close()
-                if self._websocket is websocket:
-                    self._websocket = None
+        """Run a single WebSocket session, surfacing transport failures to the
+        outer supervisor.
+
+        The old implementation retried connections in an inner loop.  That
+        hid transport failures from the scanner's supervisor, which owns
+        reconnect semantics and source-epoch transitions.  Instead of
+        reconnecting here, we let the ``_receiver`` task fail so the outer
+        supervisor sees the exception, bumps ``source_epoch``, and restarts
+        the whole source with fresh epoch propagation.
+        """
+        websocket: Any = None
+        heartbeat: asyncio.Task[None] | None = None
+        try:
+            websocket = await self.connect_websocket(
+                self.endpoint,
+                open_timeout=self.timeout_seconds,
+                close_timeout=1,
+                ping_interval=self.websocket_ping_interval,
+                ping_timeout=20,
+                proxy=self.proxy_url,
+            )
+            self._websocket = websocket
+            await self._subscribe(websocket)
+            if (
+                self.application_heartbeat_interval_seconds is not None
+                and self.application_heartbeat_payload is not None
+            ):
+                heartbeat = asyncio.create_task(self._send_application_heartbeats(websocket))
+            while not self._stopping:
+                raw = await websocket.recv()
+                if raw is None:
+                    raise ConnectionError("websocket closed by peer")
+                self._handle_raw(raw)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await heartbeat
+            if websocket is not None:
+                with contextlib.suppress(Exception):
+                    await websocket.close()
+            if self._websocket is websocket:
+                self._websocket = None
 
     async def _send_application_heartbeats(self, websocket: Any) -> None:
         """Send a venue-required application heartbeat while a socket is live."""
@@ -460,7 +476,7 @@ class _EventedBookStream:
         self._stopping = True
         if self._receiver is not None:
             self._receiver.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._receiver
             self._receiver = None
         if self._websocket is not None:

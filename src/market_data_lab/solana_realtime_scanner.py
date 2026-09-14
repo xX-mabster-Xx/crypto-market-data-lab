@@ -17,6 +17,7 @@ import contextlib
 import os
 import time
 import tomllib
+import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import field
@@ -374,6 +375,8 @@ def _positive_float(payload: Mapping[str, Any], key: str, default: float) -> flo
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"configuration field {key!r} must be a positive number") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"configuration field {key!r} must be finite (not NaN or Infinity)")
     if parsed <= 0:
         raise ValueError(f"configuration field {key!r} must be positive")
     return parsed
@@ -384,7 +387,16 @@ def _positive_int(payload: Mapping[str, Any], key: str, default: int) -> int:
     if isinstance(value, bool):
         raise ValueError(f"configuration field {key!r} must be a positive integer")
     try:
-        parsed = int(value)
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise ValueError(f"configuration field {key!r} must be an integer, not a fractional float")
+            parsed = int(value)
+        elif isinstance(value, Decimal):
+            if not value.is_finite() or not value == value.to_integral_value():
+                raise ValueError(f"configuration field {key!r} must be a finite integer")
+            parsed = int(value)
+        else:
+            parsed = int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"configuration field {key!r} must be a positive integer") from exc
     if parsed <= 0:
@@ -409,8 +421,9 @@ def _non_negative_int(payload: Mapping[str, Any], key: str, default: int) -> int
     value = payload.get(key, default)
     if isinstance(value, bool):
         raise ValueError(f"configuration field {key!r} must be a non-negative integer")
-    if isinstance(value, float) and not value.is_integer():
-        raise ValueError(f"configuration field {key!r} must be a non-negative integer")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"configuration field {key!r} must be a non-negative integer")
     try:
         parsed = int(value)
     except (TypeError, ValueError) as exc:

@@ -21,13 +21,14 @@ import time
 import urllib.parse
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from market_data_lab.dex_quotes import AsyncRequestPacer
 from market_data_lab.dex_quotes import DexQuoteProvider
 from market_data_lab.dex_quotes import quote_route_labels
+from market_data_lab.numeric_text import canonical_decimal_text
 from market_data_lab.quote_broker import QuoteKey
 from market_data_lab.quote_broker import QuoteResult
 from market_data_lab.realtime_scanner import MarketEvent
@@ -121,32 +122,62 @@ class ExactInputQuote:
     broker_endpoint_generation: str | None = None
     broker_quota_domain: str | None = None
     broker_policy_fingerprint: str | None = None
+    quote_slot_id: str | None = None
     route_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class QuoteRoundInput:
-    """Exact DEX input amount with an optional stable-value reference label."""
+    """Exact DEX input amount with a stable logical quote slot identifier."""
 
     amount: Decimal
     reference_notional_usdt: Decimal | None = None
+    quote_slot_id: str | None = None
+
+
+def _static_slot_id(amount: Decimal) -> str:
+    """Build a stable slot id for a static (non-dynamic) notional amount."""
+
+    return f"notional:{canonical_decimal_text(amount)}"
+
+
+def _slot_id_from_record(record: Mapping[str, Any], source_name: str) -> str | None:
+    """Extract or derive a stable quote_slot_id from a provider record.
+
+    Records that carry an explicit ``quote_slot_id`` use it directly.  Otherwise
+    the slot is derived from the ``requested_notional_quote`` and ``direction``
+    using canonical decimal text, so dynamic-size quotes share one identity.
+    Malformed records that lack both a slot and a notional are classified as
+    unmapped rather than generating a new arbitrary key per payload.
+    """
+
+    explicit = record.get("quote_slot_id")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()[:128]
+    notional = _as_decimal(record.get("requested_notional_quote"))
+    direction = record.get("direction")
+    if notional is None or not notional.is_finite() or notional <= 0:
+        return None
+    if not isinstance(direction, str) or direction not in {"buy_base", "sell_base"}:
+        return None
+    return f"notional:{canonical_decimal_text(notional)}:{direction}"
 
 
 @dataclass
 class PollingDexQuoteSource:
     """Publish one provider's public exact-input quote stream.
 
-    ``shared_request_pacer`` is deliberately injected for APIs that do not
+    ``shared_quota_pacer`` is deliberately injected for APIs that do not
     impose their own pacing.  A provider that already has a shared internal
-    pacer (Raydium/Jupiter) leaves it ``None``; that pacer is still shared
+   pacer (Raydium/Jupiter) leaves it ``None``; that pacer is still shared
     across sibling sources, so adding pairs never multiplies the quota.
-    """
+   """
 
     provider: DexQuoteProvider
     notionals: Sequence[Decimal]
     notional_supplier: Callable[[], Sequence[QuoteRoundInput]] | None = None
     minimum_round_interval_seconds: float = 0.0
-    shared_request_pacer: AsyncRequestPacer | None = None
+    shared_quota_pacer: AsyncRequestPacer | None = None
     rate_limit_circuit_breaker_events: int | None = None
     rate_limit_circuit_breaker_seconds: float = 900.0
     terminal_route_circuit_breaker_events: int | None = None
@@ -245,7 +276,7 @@ class PollingDexQuoteSource:
             "notionals_quote": [format(value, "f") for value in self.notionals],
             "dynamic_notional_supplier": self.notional_supplier is not None,
             "minimum_round_interval_seconds": self.minimum_round_interval_seconds,
-            "uses_shared_request_pacer": self.shared_request_pacer is not None,
+            "uses_shared_quota_pacer": self.shared_quota_pacer is not None,
             "quote_ttl_seconds": self.quote_ttl_seconds,
             "quota_domain": self.quota_domain,
             "broker_endpoint_generation": self._endpoint_generation,
@@ -284,7 +315,7 @@ class PollingDexQuoteSource:
                         format(item.reference_notional_usdt, "f")
                         if item.reference_notional_usdt is not None
                         else None
-                    ),
+                     ),
                 }
                 for item in self._last_round_inputs
             ],
@@ -394,6 +425,7 @@ class PollingDexQuoteSource:
             broker_endpoint_generation=self._endpoint_generation,
             broker_quota_domain=self.quota_domain,
             broker_policy_fingerprint=self._policy_fingerprint,
+            quote_slot_id=_slot_id_from_record(record, self.name),
             route_ids=quote_route_labels(record),
         )
 
@@ -520,6 +552,7 @@ class PollingDexQuoteSource:
             "request_rtt_ms": quote.request_rtt_ms,
             "block_number": quote.block_number,
             "error": quote.error,
+            "quote_slot_id": quote.quote_slot_id,
         }
 
     async def _publish_record(self, publish: Publish, record: Mapping[str, Any]) -> None:
@@ -533,28 +566,31 @@ class PollingDexQuoteSource:
             self._recent_errors.append(quote.error)
         elif quote.status == "ok":
             self._last_error = None
-        notional = (
-            format(quote.requested_notional_quote, "f")
-            if quote.requested_notional_quote is not None
-            else "unknown"
-        )
+        slot_id = quote.quote_slot_id or "unmapped"
         direction = quote.direction or "unknown"
         await publish(
             MarketEvent(
                 source=self.name,
-                key=f"{self.name}:{notional}:{direction}",
+                key=f"{self.name}:{slot_id}:{direction}",
                 kind="exact_input_quote",
                 value=quote,
                 summary=self._summary(quote),
                 received_realtime_ns=quote.response_received_realtime_ns,
                 received_monotonic_ns=quote.response_received_monotonic_ns,
                 chain_position=quote.block_number,
+                instrument_or_pool_id=f"{self.name}:{slot_id}:{direction}",
             ),
         )
 
     def _round_inputs(self) -> tuple[QuoteRoundInput, ...]:
         if self.notional_supplier is None:
-            return tuple(QuoteRoundInput(amount=value) for value in self.notionals)
+            return tuple(
+                QuoteRoundInput(
+                    amount=value,
+                    quote_slot_id=_static_slot_id(value),
+                )
+                for value in self.notionals
+            )
         supplied = self.notional_supplier()
         normalized: list[QuoteRoundInput] = []
         for item in supplied:
@@ -570,7 +606,17 @@ class PollingDexQuoteSource:
                 )
             ):
                 continue
-            normalized.append(item)
+            slot_id = item.quote_slot_id
+            if not slot_id:
+                if item.reference_notional_usdt is not None:
+                    slot_id = f"triangle-reference-usdt:{canonical_decimal_text(item.reference_notional_usdt)}"
+                else:
+                    slot_id = _static_slot_id(item.amount)
+            normalized.append(
+                item
+                if item.quote_slot_id == slot_id
+                else replace(item, quote_slot_id=slot_id)
+            )
         return tuple(normalized)
 
     @staticmethod
@@ -584,6 +630,9 @@ class PollingDexQuoteSource:
             return record
         payload = dict(record)
         payload["reference_notional_usdt"] = format(reference, "f")
+        payload["quote_slot_id"] = (
+            f"triangle-reference-usdt:{canonical_decimal_text(reference)}"
+        )
         return payload
 
     async def run(self, publish: Publish, stop_event: asyncio.Event) -> None:
@@ -602,7 +651,7 @@ class PollingDexQuoteSource:
                     await asyncio.wait_for(
                         stop_event.wait(),
                         timeout=resume_at - time.monotonic(),
-                    )
+                     )
                 except TimeoutError:
                     pass
                 continue
@@ -639,8 +688,6 @@ class PollingDexQuoteSource:
                 for item in round_inputs
                 if item.reference_notional_usdt is not None
             }
-            if self.shared_request_pacer is not None:
-                await self.shared_request_pacer.wait()
             try:
                 records = await self.provider.quote_round(self._rounds, notionals)
             except asyncio.CancelledError:
@@ -670,8 +717,8 @@ class PollingDexQuoteSource:
                         self._with_reference_notional(
                             record,
                             reference_by_notional=reference_by_notional,
-                        ),
-                    )
+                         ),
+                     )
             rate_limited_records = [
                 record
                 for record in records
@@ -685,8 +732,8 @@ class PollingDexQuoteSource:
                 # that provider.  This is crucial: a 429 for one pair is a
                 # quota signal for the endpoint, not an invitation to probe
                 # the next pair at the same rate.
-                if self.shared_request_pacer is not None:
-                    await self.shared_request_pacer.defer(
+                if self.shared_quota_pacer is not None:
+                    await self.shared_quota_pacer.defer(
                         cooldown_seconds=min(120.0, 5.0 * (2 ** min(self._rate_limit_streak, 5))),
                     )
                 if (
@@ -695,7 +742,7 @@ class PollingDexQuoteSource:
                 ):
                     self._rate_limit_circuit_breaker_until = (
                         time.monotonic() + self.rate_limit_circuit_breaker_seconds
-                    )
+                     )
             else:
                 self._rate_limit_streak = 0
             terminal_route_records = [
@@ -714,7 +761,7 @@ class PollingDexQuoteSource:
                 ):
                     self._terminal_route_circuit_breaker_until = (
                         time.monotonic() + self.terminal_route_circuit_breaker_seconds
-                    )
+                     )
             elapsed = time.monotonic() - round_started
             delay = max(0.0, self.minimum_round_interval_seconds - elapsed)
             # A provider exception or malformed empty response must not turn

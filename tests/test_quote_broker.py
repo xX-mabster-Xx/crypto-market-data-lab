@@ -187,6 +187,29 @@ class QuoteBrokerTest(unittest.IsolatedAsyncioTestCase):
             monotonic_ns=clock.monotonic_ns,
             realtime_ns=clock.realtime_ns,
         )
+        key = _key()
+        tasks = [
+            asyncio.create_task(
+                broker.get_quote(_request(clock, f"consumer-{index}", key)),
+            )
+            for index in range(10)
+        ]
+        await started.wait()
+        await asyncio.sleep(0)
+        self.assertEqual(calls, 1)
+        release.set()
+        results = await asyncio.gather(*tasks)
+        served_from_values = {result.served_from for result in results}
+        self.assertIn("remote", served_from_values)
+        self.assertIn("inflight_shared", served_from_values)
+        self.assertTrue(len(results) == 10)
+        self.assertEqual(broker._counts["inflight_joins"], 9)
+        # Follow-up after completion should take cache (within TTL).
+        clock.advance(nanoseconds=10_000_000)
+        third = await broker.get_quote(_request(clock, "consumer-followup", key))
+        self.assertEqual(third.served_from, "cache")
+        self.assertEqual(calls, 1)
+        await broker.close()
 
     async def test_simulation_backend_is_deduped_without_remote_quota(self) -> None:
         clock = _Clock()

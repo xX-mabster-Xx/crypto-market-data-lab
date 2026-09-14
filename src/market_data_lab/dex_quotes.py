@@ -209,6 +209,8 @@ class DexQuoteProvider(Protocol):
         notionals: Sequence[Decimal],
     ) -> list[dict[str, Any]]: ...
 
+    def config(self) -> Mapping[str, Any]: ...
+
 
 def quote_route_labels(record: Mapping[str, Any]) -> tuple[str, ...]:
     """Return bounded DEX labels from an aggregator quote record.
@@ -237,8 +239,6 @@ def quote_route_labels(record: Mapping[str, Any]) -> tuple[str, ...]:
         if compact:
             labels.append(compact)
     return tuple(dict.fromkeys(labels))
-
-    def config(self) -> dict[str, Any]: ...
 
 
 def _redact_url(url: str) -> str:
@@ -533,12 +533,14 @@ class UniswapV3Provider:
         *,
         proxy_url: str | None,
         timeout_seconds: float,
+        request_pacer: AsyncRequestPacer | None = None,
         fetch_json: JsonFetcher = _fetch_json_sync,
     ) -> None:
         self.market = market
         self.name = market.provider
         self.proxy_url = proxy_url
         self.timeout_seconds = timeout_seconds
+        self.request_pacer = request_pacer
         self.fetch_json = fetch_json
 
     def config(self) -> dict[str, Any]:
@@ -553,10 +555,17 @@ class UniswapV3Provider:
             "block_tag": self.market.block_tag,
             "quoter_address": self.market.quoter_address,
             "fee_tiers": list(self.market.fee_tiers),
+            "minimum_request_interval_seconds": (
+                self.request_pacer.minimum_interval_seconds
+                if self.request_pacer is not None
+                else None
+            ),
             "api_credentials_required": False,
         }
 
     async def _batch(self, calls: list[dict[str, Any]]) -> TimedResponse:
+        if self.request_pacer is not None:
+            await self.request_pacer.wait()
         body = json.dumps(calls, separators=(",", ":")).encode()
         return await _timed_fetch(
             self.fetch_json,
@@ -1470,6 +1479,7 @@ class OmnistonProvider(RaydiumProvider):
         *,
         proxy_url: str | None,
         timeout_seconds: float,
+        request_pacer: AsyncRequestPacer | None = None,
         quote_selection_window_seconds: float = 0.5,
         max_price_slippage_bps: int = 50,
         max_routes: int = 4,
@@ -1497,6 +1507,7 @@ class OmnistonProvider(RaydiumProvider):
         self.allow_risky_routes = allow_risky_routes
         self.endpoint = endpoint
         self.connect_websocket = connect_websocket
+        self.request_pacer = request_pacer
 
     def config(self) -> dict[str, Any]:
         return {
@@ -1510,6 +1521,11 @@ class OmnistonProvider(RaydiumProvider):
             "max_price_slippage_bps": self.max_price_slippage_bps,
             "max_routes": self.max_routes,
             "allow_risky_routes": self.allow_risky_routes,
+            "minimum_request_interval_seconds": (
+                self.request_pacer.minimum_interval_seconds
+                if self.request_pacer is not None
+                else None
+            ),
             "api_credentials_required": False,
             "api_credentials_used": False,
             "wallet_or_taker_supplied": False,
@@ -1555,6 +1571,8 @@ class OmnistonProvider(RaydiumProvider):
         }
 
     async def _quote(self, input_asset: Asset, output_asset: Asset, amount_raw: int) -> TimedResponse:
+        if self.request_pacer is not None:
+            await self.request_pacer.wait()
         connection_started_monotonic_ns = time.monotonic_ns()
         sent_realtime_ns = time.time_ns()
         sent_monotonic_ns = time.monotonic_ns()
@@ -1777,6 +1795,7 @@ class StonFiProvider:
         proxy_url: str | None,
         timeout_seconds: float,
         slippage_tolerance: Decimal = Decimal("0.005"),
+        request_pacer: AsyncRequestPacer | None = None,
         name: str | None = None,
         base: Asset | None = None,
         quote: Asset | None = None,
@@ -1788,6 +1807,7 @@ class StonFiProvider:
         self.proxy_url = proxy_url
         self.timeout_seconds = timeout_seconds
         self.slippage_tolerance = slippage_tolerance
+        self.request_pacer = request_pacer
         self.fetch_json = fetch_json
 
     def config(self) -> dict[str, Any]:
@@ -1799,6 +1819,11 @@ class StonFiProvider:
             "source_kind": "vendor_swap_simulation_api",
             "endpoint_origin": _redact_url(self.endpoint),
             "slippage_tolerance": _decimal_text(self.slippage_tolerance),
+            "minimum_request_interval_seconds": (
+                self.request_pacer.minimum_interval_seconds
+                if self.request_pacer is not None
+                else None
+            ),
             "api_credentials_required": False,
             "limitation": (
                 "API quote has no raw shard/account arrival timestamp; TON execution is an "
@@ -1807,9 +1832,11 @@ class StonFiProvider:
         }
 
     async def _quote(self, input_asset: Asset, output_asset: Asset, amount_raw: int) -> TimedResponse:
+        if self.request_pacer is not None:
+            await self.request_pacer.wait()
         query = urllib.parse.urlencode(
             {
-                "offer_address": input_asset.address,
+            "offer_address": input_asset.address,
                 "ask_address": output_asset.address,
                 "units": str(amount_raw),
                 "slippage_tolerance": _decimal_text(self.slippage_tolerance),
@@ -2050,16 +2077,21 @@ def build_providers(
     )
     jupiter_pacer = AsyncRequestPacer(jupiter_interval)
     raydium_pacer = AsyncRequestPacer(args.raydium_min_request_interval_seconds)
+    # Shared quota pacers for providers that delegate pacing to the shared
+    # pacer rather than carrying their own per-request gate.
+    ton_pacer = AsyncRequestPacer(args.ton_min_request_interval_seconds)
+    evm_pacer = AsyncRequestPacer(args.evm_min_request_interval_seconds)
     for name in args.providers:
         if name in evm:
-            providers.append(
-                UniswapV3Provider(
-                    evm[name],
-                    proxy_url=args.proxy_url,
-                    timeout_seconds=args.timeout_seconds,
-                    fetch_json=fetch_json,
-                ),
-            )
+           providers.append(
+               UniswapV3Provider(
+                   evm[name],
+                   proxy_url=args.proxy_url,
+                   timeout_seconds=args.timeout_seconds,
+                    request_pacer=evm_pacer,
+                   fetch_json=fetch_json,
+               ),
+           )
         elif name in SOLANA_PROVIDER_BASES:
             providers.append(
                 RaydiumProvider(
@@ -2114,25 +2146,27 @@ def build_providers(
             )
         elif name in TON_PROVIDER_BASES:
             providers.append(
-                StonFiProvider(
-                    name=name,
-                    base=TON_PROVIDER_BASES[name],
-                    quote=TON_USDT,
-                    proxy_url=args.proxy_url,
-                    timeout_seconds=args.timeout_seconds,
-                    slippage_tolerance=args.stonfi_slippage_tolerance,
-                    fetch_json=fetch_json,
-                ),
+               StonFiProvider(
+                   name=name,
+                   base=TON_PROVIDER_BASES[name],
+                   quote=TON_USDT,
+                   proxy_url=args.proxy_url,
+                   timeout_seconds=args.timeout_seconds,
+                   slippage_tolerance=args.stonfi_slippage_tolerance,
+                    request_pacer=ton_pacer,
+                   fetch_json=fetch_json,
+               ),
             )
         elif name in OMNISTON_PROVIDER_BASES:
             providers.append(
-                OmnistonProvider(
-                    name=name,
-                    base=OMNISTON_PROVIDER_BASES[name],
-                    quote=TON_USDT,
-                    proxy_url=args.proxy_url,
-                    timeout_seconds=args.timeout_seconds,
-                    quote_selection_window_seconds=(
+               OmnistonProvider(
+                   name=name,
+                   base=OMNISTON_PROVIDER_BASES[name],
+                   quote=TON_USDT,
+                   proxy_url=args.proxy_url,
+                   timeout_seconds=args.timeout_seconds,
+                    request_pacer=ton_pacer,
+                   quote_selection_window_seconds=(
                         args.omniston_quote_selection_window_seconds
                     ),
                     max_price_slippage_bps=args.omniston_max_price_slippage_bps,
@@ -2367,6 +2401,18 @@ def _parser() -> argparse.ArgumentParser:
         type=Decimal,
         default=Decimal("0.005"),
     )
+    parser.add_argument(
+        "--ton-min-request-interval-seconds",
+        type=float,
+        default=0.6,
+        help="Shared STON.fi/Omniston request-start spacing",
+    )
+    parser.add_argument(
+        "--evm-min-request-interval-seconds",
+        type=float,
+        default=0.6,
+        help="Shared Uniswap EVM RPC call spacing",
+    )
     parser.add_argument("--omniston-ws-url", default=OMNISTON_WS_ENDPOINT)
     parser.add_argument("--omniston-quote-selection-window-seconds", type=float, default=0.5)
     parser.add_argument("--omniston-max-price-slippage-bps", type=int, default=50)
@@ -2399,6 +2445,10 @@ def main() -> None:
         raise SystemExit("--jupiter-min-request-interval-seconds cannot be negative")
     if not Decimal("0") <= args.stonfi_slippage_tolerance < Decimal("1"):
         raise SystemExit("--stonfi-slippage-tolerance must be in [0, 1)")
+    if args.ton_min_request_interval_seconds < 0:
+        raise SystemExit("--ton-min-request-interval-seconds cannot be negative")
+    if args.evm_min_request_interval_seconds < 0:
+        raise SystemExit("--evm-min-request-interval-seconds cannot be negative")
     if args.omniston_quote_selection_window_seconds < 0:
         raise SystemExit("--omniston-quote-selection-window-seconds cannot be negative")
     if args.omniston_max_price_slippage_bps < 0:

@@ -95,6 +95,7 @@ def _dex_quote(
         round_id=round_id,
         requested_notional_quote=Decimal("100"),
         reference_notional_usdt=Decimal("100"),
+        quote_slot_id="notional:100:buy_base" if direction == "buy_base" else "notional:100:sell_base",
         base_amount=Decimal(base_amount),
         quote_amount=Decimal(quote_amount),
         input_symbol=input_symbol,
@@ -615,7 +616,7 @@ class UnifiedPerpAnalyzerTest(unittest.IsolatedAsyncioTestCase):
             snapshot = analyzer.snapshot()
 
             self.assertIs(
-                analyzer._dex_quotes[("RAYDIUM", "100", "buy_base")],
+                analyzer._dex_quotes[("RAYDIUM", "notional:100:buy_base", "buy_base")],
                 fresh,
             )
             self.assertEqual(snapshot["counts"]["exact_quote_out_of_order_ignored"], 1)
@@ -698,6 +699,7 @@ class UnifiedPerpAnalyzerTest(unittest.IsolatedAsyncioTestCase):
             round_id=1,
             requested_notional_quote=Decimal("100"),
             reference_notional_usdt=Decimal("100"),
+            quote_slot_id="notional:100:buy_base",
             base_amount=Decimal("1"),
             quote_amount=Decimal("100"),
             input_symbol="USDC",

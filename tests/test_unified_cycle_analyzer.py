@@ -8,6 +8,7 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
+from dataclasses import replace
 from market_data_lab.cex_dex_cycles import BookSnapshot
 from market_data_lab.cex_dex_cycles import MARKETS
 from market_data_lab.dex_quotes import TimedResponse
@@ -16,6 +17,38 @@ from market_data_lab.realtime_scanner import MarketEvent
 from market_data_lab.solana_realtime_scanner import CexBookStateSource
 from market_data_lab.solana_realtime_scanner import CexStreamConfig
 from market_data_lab.unified_cycle_analyzer import UnifiedCycleAnalyzer
+
+
+def _good_quote(*, now_realtime_ns: int, now_monotonic_ns: int) -> ExactInputQuote:
+    """Build a valid buy_base ExactInputQuote for the SOL/SOLANA_RAYDIUM market."""
+    market = MARKETS["SOL_SOLANA_RAYDIUM"]
+    return ExactInputQuote(
+        provider=market.provider,
+        chain="solana",
+        protocol="test",
+        source_kind="test",
+        pair="SOL/USDC",
+        direction="buy_base",
+        round_id=1,
+        requested_notional_quote=Decimal("100"),
+        reference_notional_usdt=Decimal("100"),
+        quote_slot_id="notional:100:buy_base",
+        base_amount=Decimal("1"),
+        quote_amount=Decimal("100"),
+        input_symbol="USDC",
+        output_symbol="SOL",
+        input_amount_raw=100_000_000,
+        output_amount_raw=1_000_000_000,
+        average_price_quote_per_base=Decimal("100"),
+        fee_bps=Decimal("20"),
+        request_rtt_ms=5,
+        status="ok",
+        error=None,
+        response_received_realtime_ns=now_realtime_ns,
+        response_received_monotonic_ns=now_monotonic_ns,
+        block_number=None,
+    )
+
 
 
 def _book(*, symbol: str, now_realtime_ns: int, now_monotonic_ns: int) -> BookSnapshot:
@@ -67,6 +100,7 @@ class UnifiedCycleAnalyzerTest(unittest.IsolatedAsyncioTestCase):
             round_id=1,
             requested_notional_quote=Decimal("100"),
             reference_notional_usdt=Decimal("100"),
+            quote_slot_id="notional:100:buy_base",
             base_amount=Decimal("1"),
             quote_amount=Decimal("100"),
             input_symbol="USDC",
@@ -118,6 +152,203 @@ class UnifiedCycleAnalyzerTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(events[0]["best_cycle"]["cex_fee_account_verified"])
             self.assertEqual(events[-1]["event"], "candidate_closed")
             self.assertFalse((output / "raw.jsonl").exists())
+
+    async def test_bug014_remove_quote_key_cleans_all_indexes(self) -> None:
+        """Section 20.1: removing a quote key must clean all secondary indexes."""
+        now_realtime_ns = time.time_ns()
+        now_monotonic_ns = time.monotonic_ns()
+        source = CexBookStateSource(
+            config=CexStreamConfig(venue="MEXC", category="spot", symbols=("SOLUSDC",)),
+            timeout_seconds=1,
+            proxy_url=None,
+        )
+        source._latest_books["SOLUSDC"] = _book(  # noqa: SLF001
+            symbol="SOLUSDC",
+            now_realtime_ns=now_realtime_ns,
+            now_monotonic_ns=now_monotonic_ns,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            output.mkdir()
+            analyzer = UnifiedCycleAnalyzer(
+                output_directory=output,
+                cex_sources=(source,),
+                coalesce_interval_ms=1,
+            )
+            quote = _good_quote(
+                now_realtime_ns=now_realtime_ns,
+                now_monotonic_ns=now_monotonic_ns,
+            )
+            await analyzer.handle_event(
+                MarketEvent(
+                    source="dexquote:RAYDIUM",
+                    key="test",
+                    kind="exact_input_quote",
+                    value=quote,
+                    summary={},
+                    received_realtime_ns=now_realtime_ns,
+                    received_monotonic_ns=now_monotonic_ns,
+                ),
+            )
+            key = analyzer._quote_key(quote)
+            self.assertIsNotNone(key)
+            self.assertIn(key, analyzer._direct_quotes)
+            # Remove and verify all indexes are cleaned.
+            removed = analyzer._remove_quote_key(key)
+            self.assertTrue(removed)
+            self.assertNotIn(key, analyzer._direct_quotes)
+            self.assertNotIn(key, analyzer._quote_keys_by_direct_provider[quote.provider])
+            self.assertFalse(any(dk == key for dk in analyzer._dirty_direct))
+            # Cardinality must match.
+            self.assertEqual(
+                len(analyzer._direct_quotes),
+                sum(len(v) for v in analyzer._quote_keys_by_direct_provider.values()),
+            )
+
+    async def test_bug014_purge_provider_cleans_all_indexes(self) -> None:
+        """Section 20.1: _purge_provider must clean all secondary indexes."""
+        now_realtime_ns = time.time_ns()
+        now_monotonic_ns = time.monotonic_ns()
+        source = CexBookStateSource(
+            config=CexStreamConfig(venue="MEXC", category="spot", symbols=("SOLUSDC",)),
+            timeout_seconds=1,
+            proxy_url=None,
+        )
+        source._latest_books["SOLUSDC"] = _book(  # noqa: SLF001
+            symbol="SOLUSDC",
+            now_realtime_ns=now_realtime_ns,
+            now_monotonic_ns=now_monotonic_ns,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            output.mkdir()
+            analyzer = UnifiedCycleAnalyzer(
+                output_directory=output,
+                cex_sources=(source,),
+                coalesce_interval_ms=1,
+            )
+            quote = _good_quote(
+                now_realtime_ns=now_realtime_ns,
+                now_monotonic_ns=now_monotonic_ns,
+            )
+            await analyzer.handle_event(
+                MarketEvent(
+                    source="dexquote:RAYDIUM",
+                    key="test",
+                    kind="exact_input_quote",
+                    value=quote,
+                    summary={},
+                    received_realtime_ns=now_realtime_ns,
+                    received_monotonic_ns=now_monotonic_ns,
+                ),
+            )
+            removed = analyzer._purge_provider(quote.provider)
+            self.assertGreaterEqual(removed, 1)
+            self.assertNotIn(quote.provider, analyzer._quote_keys_by_direct_provider)
+            self.assertEqual(
+                len(analyzer._direct_quotes),
+                len(analyzer._quote_keys_by_direct_provider.get(quote.provider, set())),
+            )
+            self.assertFalse(any(dk[0] == quote.provider for dk in analyzer._dirty_direct))
+
+    async def test_bug014_purge_source_epoch_cleans_all_indexes(self) -> None:
+        """Section 20.1: _purge_source_epoch must not leave dangling index entries."""
+        now_realtime_ns = time.time_ns()
+        now_monotonic_ns = time.monotonic_ns()
+        source = CexBookStateSource(
+            config=CexStreamConfig(venue="MEXC", category="spot", symbols=("SOLUSDC",)),
+            timeout_seconds=1,
+            proxy_url=None,
+        )
+        source._latest_books["SOLUSDC"] = _book(  # noqa: SLF001
+            symbol="SOLUSDC",
+            now_realtime_ns=now_realtime_ns,
+            now_monotonic_ns=now_monotonic_ns,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            output.mkdir()
+            analyzer = UnifiedCycleAnalyzer(
+                output_directory=output,
+                cex_sources=(source,),
+                coalesce_interval_ms=1,
+            )
+            old_quote = replace(
+                _good_quote(now_realtime_ns=now_realtime_ns, now_monotonic_ns=now_monotonic_ns),
+                source_epoch=2,
+            )
+            await analyzer.handle_event(
+                MarketEvent(
+                    source="dexquote:RAYDIUM",
+                    key="test",
+                    kind="exact_input_quote",
+                    value=old_quote,
+                    summary={},
+                    received_realtime_ns=now_realtime_ns,
+                    received_monotonic_ns=now_monotonic_ns,
+                    source_epoch=2,
+                ),
+            )
+            key = analyzer._quote_key(old_quote)
+            self.assertIn(key, analyzer._direct_quotes)
+            removed = analyzer._purge_source_epoch("test", old_epoch=2)
+            self.assertGreaterEqual(removed, 1)
+            self.assertNotIn(key, analyzer._direct_quotes)
+            self.assertNotIn(key, analyzer._quote_keys_by_direct_provider[old_quote.provider])
+            # Cardinality must match.
+            self.assertEqual(
+                len(analyzer._direct_quotes),
+                sum(len(v) for v in analyzer._quote_keys_by_direct_provider.values()),
+            )
+
+    async def test_bug014_prune_expired_quotes_physically_removes(self) -> None:
+        """Section 20.2: expired quotes must be physically removed + indexes cleaned."""
+        now_realtime_ns = time.time_ns()
+        now_monotonic_ns = time.monotonic_ns()
+        source = CexBookStateSource(
+            config=CexStreamConfig(venue="MEXC", category="spot", symbols=("SOLUSDC",)),
+            timeout_seconds=1,
+            proxy_url=None,
+        )
+        source._latest_books["SOLUSDC"] = _book(  # noqa: SLF001
+            symbol="SOLUSDC",
+            now_realtime_ns=now_realtime_ns,
+            now_monotonic_ns=now_monotonic_ns,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "run"
+            output.mkdir()
+            analyzer = UnifiedCycleAnalyzer(
+                output_directory=output,
+                cex_sources=(source,),
+                max_response_skew_ms=Decimal("1000"),
+                coalesce_interval_ms=1,
+            )
+            stale_quote = replace(
+                _good_quote(now_realtime_ns=now_realtime_ns, now_monotonic_ns=now_monotonic_ns),
+                response_received_monotonic_ns=now_monotonic_ns - 5_000_000_000,  # 5 seconds old
+            )
+            await analyzer.handle_event(
+                MarketEvent(
+                    source="dexquote:RAYDIUM",
+                    key="test",
+                    kind="exact_input_quote",
+                    value=stale_quote,
+                    summary={},
+                    received_realtime_ns=now_realtime_ns,
+                    received_monotonic_ns=now_monotonic_ns,
+                ),
+            )
+            key = analyzer._quote_key(stale_quote)
+            self.assertIn(key, analyzer._direct_quotes)
+            pruned = analyzer._prune_expired_quotes(time.monotonic_ns())
+            self.assertGreaterEqual(pruned, 1)
+            self.assertNotIn(key, analyzer._direct_quotes)
+            # No key exists only in the secondary index.
+            self.assertEqual(
+                len(analyzer._direct_quotes),
+                sum(len(v) for v in analyzer._quote_keys_by_direct_provider.values()),
+            )
 
 
 if __name__ == "__main__":

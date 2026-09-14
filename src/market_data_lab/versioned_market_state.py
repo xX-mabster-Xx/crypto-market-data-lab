@@ -301,6 +301,21 @@ class VersionedMarketState:
         self._counts["states_expired"] += len(expired)
         return tuple(sorted(expired))
 
+    def retire(self, state_key: str) -> bool:
+        """Physically remove a state key and clean up all index structures."""
+
+        record = self._records.pop(state_key, None)
+        if record is None:
+            return False
+        source_id = record.event.source_id
+        keys = self._keys_by_source.get(source_id)
+        if keys is not None:
+            keys.discard(state_key)
+            if not keys:
+                self._keys_by_source.pop(source_id, None)
+        self._counts["retired"] += 1
+        return True
+
     def latest(self, state_key: str) -> VersionedStateRecord | None:
         return self._records.get(state_key)
 

@@ -220,7 +220,7 @@ def _build_exact_quote_sources(
             provider=provider,
             notionals=DEFAULT_EXACT_QUOTE_NOTIONALS,
             notional_supplier=triangle_suppliers.get(provider_name),
-            shared_request_pacer=external_pacer(provider),
+           shared_quota_pacer=external_pacer(provider),
             rate_limit_circuit_breaker_events=rate_limit_circuit_breaker_events(provider),
             rate_limit_circuit_breaker_seconds=rate_limit_circuit_breaker_seconds(provider),
             terminal_route_circuit_breaker_events=terminal_route_circuit_breaker_events(provider),
@@ -407,6 +407,10 @@ def build_unified_market_data_scanner(
         event_handler=handle_event,
         status_providers=status_providers,
         shutdown_handlers=(shutdown_sequential, analyzer.close, perp_analyzer.close, quote_broker.close),
+        epoch_change_handlers=(
+            lambda source, old_epoch, new_epoch: analyzer.handle_source_epoch_change(source, old_epoch, new_epoch),
+            lambda source, old_epoch, new_epoch: perp_analyzer.handle_source_epoch_change(source, old_epoch, new_epoch),
+        ),
     )
 
 

@@ -613,3 +613,64 @@ class LongTailRegistryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EventedBookStreamTransportFailureTest(unittest.IsolatedAsyncioTestCase):
+    """BUG-004: transport failures must propagate to the outer supervisor."""
+
+    async def test_transport_failure_propagates_instead_of_silent_reconnect(self) -> None:
+        from market_data_lab.cex_book_streams import BybitOrderBookStream
+
+        async def connect(*_args, **_kwargs):
+            raise ConnectionError("test: transport failure")
+
+        stream = BybitOrderBookStream(
+            ("BTCUSDT",),
+            timeout_seconds=1,
+            proxy_url=None,
+            connect_websocket=connect,
+        )
+        try:
+            await stream.start()
+            self.fail("expected RuntimeError from transport failure")
+        except RuntimeError as exc:
+            self.assertIn("transport", str(exc).lower())
+            self.assertIsNotNone(stream.error)
+        finally:
+            await stream.close()
+
+    async def test_next_update_raises_after_receiver_task_exits(self) -> None:
+        from market_data_lab.cex_book_streams import BybitOrderBookStream
+
+        class _FailingWebsocket:
+            sent = False
+
+            async def send(self, data: str) -> None:
+                self.sent = True
+
+            async def recv(self) -> str:
+                raise ConnectionError("test: recv failure")
+
+            async def close(self) -> None:
+                pass
+
+        async def connect(*_args, **_kwargs):
+            return _FailingWebsocket()
+
+        stream = BybitOrderBookStream(
+            ("BTCUSDT",),
+            timeout_seconds=1,
+            proxy_url=None,
+            connect_websocket=connect,
+        )
+        try:
+            await stream.start()
+            self.fail("expected RuntimeError from transport failure during start")
+        except RuntimeError:
+            pass
+        finally:
+            await stream.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
