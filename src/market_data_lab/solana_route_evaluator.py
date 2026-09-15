@@ -406,7 +406,9 @@ def _conservative_sell_proceeds(
 @dataclass
 class _CandidateState:
     started_realtime_ns: int
+    started_monotonic_ns: int
     last_seen_realtime_ns: int
+    last_seen_monotonic_ns: int
     observations: int
     best_edge_bps: Decimal
     best_pnl: Decimal
@@ -490,7 +492,13 @@ class _CandidateLedger:
         self.improved = 0
         self.closed = 0
 
-    def observe(self, cycle: Mapping[str, Any], *, observed_realtime_ns: int) -> list[dict[str, Any]]:
+    def observe(
+        self,
+        cycle: Mapping[str, Any],
+        *,
+        observed_realtime_ns: int,
+        observed_monotonic_ns: int,
+    ) -> list[dict[str, Any]]:
         route_id = str(cycle.get("route_id", ""))
         direction = str(cycle.get("direction", ""))
         key = f"{route_id}|{direction}"
@@ -514,13 +522,26 @@ class _CandidateLedger:
             self.active.pop(key)
             self.closed += 1
             state.last_seen_realtime_ns = observed_realtime_ns
-            return [self._event("candidate_closed", key, state, observed_realtime_ns, cycle, "not_positive_or_not_timing_valid")]
+            state.last_seen_monotonic_ns = observed_monotonic_ns
+            return [
+                self._event(
+                    "candidate_closed",
+                    key,
+                    state,
+                    observed_realtime_ns,
+                    observed_monotonic_ns,
+                    cycle,
+                    "not_positive_or_not_timing_valid",
+                ),
+            ]
 
         compact = _compact_cycle(cycle)
         if state is None:
             state = _CandidateState(
                 started_realtime_ns=observed_realtime_ns,
+                started_monotonic_ns=observed_monotonic_ns,
                 last_seen_realtime_ns=observed_realtime_ns,
+                last_seen_monotonic_ns=observed_monotonic_ns,
                 observations=1,
                 best_edge_bps=edge,
                 best_pnl=pnl,
@@ -528,26 +549,64 @@ class _CandidateLedger:
             )
             self.active[key] = state
             self.started += 1
-            return [self._event("candidate_started", key, state, observed_realtime_ns, cycle, None)]
+            return [
+                self._event(
+                    "candidate_started",
+                    key,
+                    state,
+                    observed_realtime_ns,
+                    observed_monotonic_ns,
+                    cycle,
+                    None,
+                ),
+            ]
 
         state.last_seen_realtime_ns = observed_realtime_ns
+        state.last_seen_monotonic_ns = observed_monotonic_ns
         state.observations += 1
         if edge >= state.best_edge_bps + self.improvement_bps:
             state.best_edge_bps = edge
             state.best_pnl = max(state.best_pnl, pnl)
             state.best_cycle = compact
             self.improved += 1
-            return [self._event("candidate_improved", key, state, observed_realtime_ns, cycle, None)]
+            return [
+                self._event(
+                    "candidate_improved",
+                    key,
+                    state,
+                    observed_realtime_ns,
+                    observed_monotonic_ns,
+                    cycle,
+                    None,
+                ),
+            ]
         state.best_pnl = max(state.best_pnl, pnl)
         return []
 
-    def close_all(self, *, observed_realtime_ns: int, reason: str) -> list[dict[str, Any]]:
+    def close_all(
+        self,
+        *,
+        observed_realtime_ns: int,
+        observed_monotonic_ns: int,
+        reason: str,
+    ) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         for key, state in tuple(self.active.items()):
             self.active.pop(key)
             self.closed += 1
             state.last_seen_realtime_ns = observed_realtime_ns
-            events.append(self._event("candidate_closed", key, state, observed_realtime_ns, None, reason))
+            state.last_seen_monotonic_ns = observed_monotonic_ns
+            events.append(
+                self._event(
+                    "candidate_closed",
+                    key,
+                    state,
+                    observed_realtime_ns,
+                    observed_monotonic_ns,
+                    None,
+                    reason,
+                ),
+            )
         return events
 
     @staticmethod
@@ -556,6 +615,7 @@ class _CandidateLedger:
         key: str,
         state: _CandidateState,
         observed_realtime_ns: int,
+        observed_monotonic_ns: int,
         cycle: Mapping[str, Any] | None,
         close_reason: str | None,
     ) -> dict[str, Any]:
@@ -567,7 +627,7 @@ class _CandidateLedger:
             "last_seen_at": _utc_from_ns(state.last_seen_realtime_ns),
             "event_at": _utc_from_ns(observed_realtime_ns),
             "duration_seconds": round(
-                max(0, observed_realtime_ns - state.started_realtime_ns) / 1_000_000_000,
+                max(0, observed_monotonic_ns - state.started_monotonic_ns) / 1_000_000_000,
                 6,
             ),
             "positive_observations": state.observations,
@@ -701,6 +761,7 @@ class SolanaRouteEvaluator:
         await self._persist_events(
             self._ledger.close_all(
                 observed_realtime_ns=change.realtime_ns,
+                observed_monotonic_ns=change.monotonic_ns,
                 reason="source_epoch_advanced",
             ),
         )
@@ -717,8 +778,14 @@ class SolanaRouteEvaluator:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        observed_realtime_ns = time.time_ns()
+        observed_monotonic_ns = time.monotonic_ns()
         await self._persist_events(
-            self._ledger.close_all(observed_realtime_ns=time.time_ns(), reason="scanner_stopped"),
+            self._ledger.close_all(
+                observed_realtime_ns=observed_realtime_ns,
+                observed_monotonic_ns=observed_monotonic_ns,
+                reason="scanner_stopped",
+            ),
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -899,8 +966,14 @@ class SolanaRouteEvaluator:
                     if runtime.best_net_pnl is None or pnl > runtime.best_net_pnl:
                         runtime.best_net_pnl = pnl
                     await self._maybe_verify_with_jupiter(route, runtime, cycle)
+            observed_realtime_ns = time.time_ns()
+            observed_monotonic_ns = time.monotonic_ns()
             await self._persist_events(
-                self._ledger.observe(cycle, observed_realtime_ns=time.time_ns()),
+                self._ledger.observe(
+                    cycle,
+                    observed_realtime_ns=observed_realtime_ns,
+                    observed_monotonic_ns=observed_monotonic_ns,
+                ),
             )
 
     def _latest_state(
@@ -1011,6 +1084,8 @@ class SolanaRouteEvaluator:
         return observed == expected
 
     async def _observe_invalid(self, route: LocalSpotRoute, *, status: str) -> None:
+        observed_realtime_ns = time.time_ns()
+        observed_monotonic_ns = time.monotonic_ns()
         for direction in ("buy_dex_base_sell_cex_base", "buy_cex_base_sell_dex_base"):
             await self._persist_events(
                 self._ledger.observe(
@@ -1021,7 +1096,8 @@ class SolanaRouteEvaluator:
                         "timing_valid": False,
                         "positive_after_network_floor": False,
                     },
-                    observed_realtime_ns=time.time_ns(),
+                    observed_realtime_ns=observed_realtime_ns,
+                    observed_monotonic_ns=observed_monotonic_ns,
                 ),
             )
 
