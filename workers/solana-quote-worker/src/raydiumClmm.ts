@@ -93,6 +93,7 @@ interface AttachedPool {
   publicKey: PublicKey;
   metadata: PoolMetadata;
   compute: ComputeClmmPoolInfo;
+  coreAccountData: Buffer;
   tickCache: TickCache;
   tickCacheAtMs: number;
   currentTickArray: number;
@@ -100,6 +101,7 @@ interface AttachedPool {
   subscriptionId: number;
   tickSubscriptions: Map<string, number>;
   tickRefresh?: Promise<void>;
+  refreshDone: Promise<void> | null;
   coreMailbox: LatestOnlyMailbox<{ account: AccountInfo<Buffer>; context: Context }>;
   stateEmitter: DebouncedStateEmitter;
 }
@@ -341,12 +343,14 @@ export class RaydiumClmmQuoteEngine {
       publicKey,
       metadata,
       compute,
+      coreAccountData: Buffer.from(account.value.data),
       tickCache,
       tickCacheAtMs: Date.now(),
       currentTickArray: currentTickArray(compute.tickCurrent, compute.tickSpacing),
       provenance,
       subscriptionId: -1,
       tickSubscriptions: new Map(),
+      refreshDone: null,
       coreMailbox: new LatestOnlyMailbox(
         account.context.slot,
         async ({ account: updated, context }) => this.processCoreUpdate(pool, updated, context),
@@ -375,6 +379,10 @@ export class RaydiumClmmQuoteEngine {
     account: AccountInfo<Buffer>,
     context: Context,
   ): Promise<boolean> {
+    // A maintenance snapshot owns core mutation while it is in flight. WS
+    // callbacks remain bounded in the mailbox and resume with only the latest.
+    const refreshDone = pool.refreshDone;
+    if (refreshDone !== null) await refreshDone;
     if (this.closed || context.slot <= pool.provenance.coreStateSlot) return false;
     const previousCompute = pool.compute;
     const previousArray = pool.currentTickArray;
@@ -390,6 +398,7 @@ export class RaydiumClmmQuoteEngine {
       throw error;
     }
     if (!pool.provenance.acceptCore(context.slot)) return false;
+    pool.coreAccountData = Buffer.from(account.data);
     this.requestPoolState(pool, `core:${context.slot}`, "immediate");
     return true;
   }
@@ -506,6 +515,11 @@ export class RaydiumClmmQuoteEngine {
 
   private async scheduleCoreRefresh(pool: AttachedPool): Promise<void> {
     if (this.closed || pool.provenance.refreshInFlight) return;
+    await pool.coreMailbox.idle();
+    if (this.closed || pool.provenance.refreshInFlight) return;
+    let finishRefresh!: () => void;
+    const refreshDone = new Promise<void>((resolve) => { finishRefresh = resolve; });
+    pool.refreshDone = refreshDone;
     pool.provenance.refreshInFlight = true;
     pool.provenance.refreshGeneration += 1;
     this.refreshesStarted += 1;
@@ -514,6 +528,8 @@ export class RaydiumClmmQuoteEngine {
       this.refreshesCompleted += 1;
     } finally {
       pool.provenance.refreshInFlight = false;
+      if (pool.refreshDone === refreshDone) pool.refreshDone = null;
+      finishRefresh();
     }
   }
 
@@ -529,7 +545,13 @@ export class RaydiumClmmQuoteEngine {
     );
     const accountValue = account.value;
     if (accountValue === null) throw new Error("Raydium pool account disappeared during refresh");
-    if (account.context.slot < pool.provenance.coreStateSlot) return;
+    if (account.context.slot <= pool.provenance.coreStateSlot) {
+      if (account.context.slot === pool.provenance.coreStateSlot) {
+        pool.provenance.noteRpcRefresh();
+        this.refreshesUnchanged += 1;
+      }
+      return;
+    }
     const compute = await this.runRpcJob(
       {
         priority: "refresh",
@@ -541,11 +563,10 @@ export class RaydiumClmmQuoteEngine {
         rpcData: PoolInfoLayout.decode(accountValue.data),
       }),
     );
-    const changed = this.coreFingerprint(pool.compute) !== this.coreFingerprint(compute);
+    const changed = !pool.coreAccountData.equals(accountValue.data);
     pool.compute = compute;
-    if (account.context.slot > pool.provenance.coreStateSlot) {
-      pool.provenance.acceptCore(account.context.slot);
-    }
+    pool.coreAccountData = Buffer.from(accountValue.data);
+    pool.provenance.acceptCore(account.context.slot);
     pool.provenance.noteRpcRefresh();
     pool.currentTickArray = currentTickArray(pool.compute.tickCurrent, pool.compute.tickSpacing);
     await this.ensureTickCache(pool, true);
@@ -603,16 +624,21 @@ export class RaydiumClmmQuoteEngine {
     };
   }
 
-  private coreFingerprint(compute: ComputeClmmPoolInfo): string {
-    return `${compute.tickCurrent}:${compute.sqrtPriceX64.toString(10)}`;
-  }
-
   private requestPoolState(
     pool: AttachedPool,
-    fingerprint: string,
+    _reason: string,
     mode: "immediate" | "debounced",
   ): void {
-    pool.stateEmitter.request(fingerprint, mode);
+    const provenance = pool.provenance.fields();
+    pool.stateEmitter.request([
+      provenance.core_state_slot,
+      provenance.dependency_slot_min ?? "",
+      provenance.dependency_slot_max ?? "",
+      provenance.dependency_generation,
+      pool.compute.tickCurrent,
+      pool.compute.sqrtPriceX64.toString(10),
+      pool.compute.liquidity.toString(10),
+    ].join(":"), mode);
   }
 
   private emitPoolStateNow(pool: AttachedPool): void {

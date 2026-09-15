@@ -78,6 +78,27 @@ test("BUG-017 mailbox continues with latest pending after processor failure", as
   assert.equal(mailbox.stats().processing, false);
 });
 
+test("BUG-017 mailbox shutdown drops pending buffer and drains only active work", async () => {
+  const gate = deferred();
+  const started = deferred();
+  const processed: number[] = [];
+  const mailbox = new LatestOnlyMailbox<number>(0, async (value) => {
+    processed.push(value);
+    started.resolve();
+    await gate.promise;
+  });
+  mailbox.submit(1, 1);
+  await started.promise;
+  mailbox.submit(2, 2);
+  const closing = mailbox.dispose();
+  assert.equal(mailbox.stats().pending, 0);
+  gate.resolve();
+  await closing;
+  assert.deepEqual(processed, [1]);
+  assert.equal(mailbox.stats().processing, false);
+  assert.equal(mailbox.submit(3, 3), false);
+});
+
 test("BUG-019 dependency storm emits one trailing latest state and disposes timer", async () => {
   const provenance = new PoolSlotProvenance(100, 0);
   const emitted: Array<ReturnType<PoolSlotProvenance["fields"]>> = [];
@@ -115,6 +136,28 @@ test("BUG-019 semantic duplicate does not emit and core update remains immediate
   assert.equal(emitter.request("core:100", "immediate"), false);
   assert.equal(emitter.request("core:101", "immediate"), true);
   assert.equal(emits, 2);
+  emitter.dispose();
+});
+
+test("BUG-019 immediate core update subsumes pending dependency notification", async () => {
+  const state = { core: 100, dependency: 0 };
+  const emitted: Array<{ core: number; dependency: number }> = [];
+  const emitter = new DebouncedStateEmitter(
+    () => emitted.push({ ...state }),
+    20,
+  );
+  emitter.request("100:0", "immediate");
+  state.dependency = 7;
+  emitter.request("100:7", "debounced");
+  state.core = 105;
+  emitter.request("105:7", "immediate");
+
+  await new Promise<void>((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(emitted, [
+    { core: 100, dependency: 0 },
+    { core: 105, dependency: 7 },
+  ]);
+  assert.equal(emitter.stats().pending, 0);
   emitter.dispose();
 });
 
@@ -172,5 +215,7 @@ test("BUG-023 production refreshes use Agent E low-priority coalescing keys", ()
     assert.match(source, /priority: "refresh"/u, file);
     assert.match(source, /coalesceKey:/u, file);
     assert.match(source, /coreRefreshDue/u, file);
+    assert.match(source, /refreshInFlight/u, file);
+    assert.match(source, /refreshesUnchanged/u, file);
   }
 });

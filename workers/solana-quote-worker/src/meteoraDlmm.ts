@@ -373,6 +373,15 @@ export class MeteoraDlmmQuoteEngine {
         pool.binSubscriptionIds.set(address, subscriptionId);
       }
     }
+    // SDK refreshes do not expose an account context slot. Preserve any
+    // subscribed value with explicit WS provenance instead of overwriting it
+    // with a contextless (and possibly older) RPC value.
+    for (const [address, item] of current) {
+      if (pool.provenance.dependencySlot(address) !== undefined) {
+        const pushed = pool.binArrays.get(address);
+        if (pushed !== undefined) current.set(address, pushed);
+      }
+    }
     pool.binArrays = current;
     pool.binCacheAtMs = Date.now();
     if (hadCache) {
@@ -410,7 +419,13 @@ export class MeteoraDlmmQuoteEngine {
   private async refreshCore(pool: AttachedPool): Promise<void> {
     const account = await this.requireConnection().getAccountInfoAndContext(pool.address, "processed");
     if (account.value === null) throw new Error("Meteora refresh returned a missing LB-pair account");
-    if (account.context.slot < pool.provenance.coreStateSlot) return;
+    if (account.context.slot <= pool.provenance.coreStateSlot) {
+      if (account.context.slot === pool.provenance.coreStateSlot) {
+        pool.provenance.noteRpcRefresh();
+        this.refreshesUnchanged += 1;
+      }
+      return;
+    }
     const changed = !pool.coreAccountData.equals(account.value.data);
     pool.dlmm.lbPair = MeteoraSdk.decodeAccount(
       pool.dlmm.program,
@@ -431,10 +446,18 @@ export class MeteoraDlmmQuoteEngine {
 
   private requestPoolState(
     pool: AttachedPool,
-    fingerprint: string,
+    _reason: string,
     mode: "immediate" | "debounced",
   ): void {
-    pool.stateEmitter.request(fingerprint, mode);
+    const provenance = pool.provenance.fields();
+    pool.stateEmitter.request([
+      provenance.core_state_slot,
+      provenance.dependency_slot_min ?? "",
+      provenance.dependency_slot_max ?? "",
+      provenance.dependency_generation,
+      pool.dlmm.lbPair.activeId,
+      pool.dlmm.lbPair.binStep,
+    ].join(":"), mode);
   }
 
   private emitPoolStateNow(pool: AttachedPool): void {

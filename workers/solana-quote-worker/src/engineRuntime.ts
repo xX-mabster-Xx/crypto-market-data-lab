@@ -63,6 +63,10 @@ export class PoolSlotProvenance {
     this.dependencySlots.delete(key);
   }
 
+  public dependencySlot(key: string): number | undefined {
+    return this.dependencySlots.get(key);
+  }
+
   public noteDependencyRefresh(receivedAtMs = performance.now()): void {
     this.dependencyReceivedAtMs = receivedAtMs;
   }

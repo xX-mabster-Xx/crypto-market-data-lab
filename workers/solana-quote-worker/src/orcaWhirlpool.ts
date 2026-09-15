@@ -469,8 +469,14 @@ export class OrcaWhirlpoolQuoteEngine {
         pool.tickSubscriptionIds.set(address, subscriptionId);
       }
     }
-    pool.tickArraysAToB = aToB;
-    pool.tickArraysBToA = bToA;
+    const preservePushed = (items: TickArray[]): TickArray[] => items.map((item) => {
+      const address = item.address.toBase58();
+      if (pool.provenance.dependencySlot(address) === undefined) return item;
+      return [...pool.tickArraysAToB, ...pool.tickArraysBToA]
+        .find((existing) => existing.address.equals(item.address)) ?? item;
+    });
+    pool.tickArraysAToB = preservePushed(aToB);
+    pool.tickArraysBToA = preservePushed(bToA);
     pool.tickCacheAtMs = Date.now();
     if (hadCache) {
       pool.provenance.advanceDependencyGeneration();
@@ -507,7 +513,13 @@ export class OrcaWhirlpoolQuoteEngine {
   private async refreshCore(pool: AttachedPool): Promise<void> {
     const account = await this.requireConnection().getAccountInfoAndContext(pool.address, "processed");
     if (account.value === null) throw new Error("Orca refresh returned a missing Whirlpool account");
-    if (account.context.slot < pool.provenance.coreStateSlot) return;
+    if (account.context.slot <= pool.provenance.coreStateSlot) {
+      if (account.context.slot === pool.provenance.coreStateSlot) {
+        pool.provenance.noteRpcRefresh();
+        this.refreshesUnchanged += 1;
+      }
+      return;
+    }
     const data = Orca.ParsableWhirlpool.parse(pool.address, account.value);
     if (data === null || Orca.PoolUtil.isInitializedWithAdaptiveFee(data)) {
       throw new Error(`Orca pool ${pool.descriptor.pool_id} became unsupported during refresh`);
@@ -528,10 +540,19 @@ export class OrcaWhirlpoolQuoteEngine {
 
   private requestPoolState(
     pool: AttachedPool,
-    fingerprint: string,
+    _reason: string,
     mode: "immediate" | "debounced",
   ): void {
-    pool.stateEmitter.request(fingerprint, mode);
+    const provenance = pool.provenance.fields();
+    pool.stateEmitter.request([
+      provenance.core_state_slot,
+      provenance.dependency_slot_min ?? "",
+      provenance.dependency_slot_max ?? "",
+      provenance.dependency_generation,
+      pool.data.tickCurrentIndex,
+      pool.data.sqrtPrice.toString(10),
+      pool.data.liquidity.toString(10),
+    ].join(":"), mode);
   }
 
   private emitPoolStateNow(pool: AttachedPool): void {

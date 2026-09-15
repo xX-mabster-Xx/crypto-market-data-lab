@@ -726,7 +726,13 @@ export class RaydiumStandardQuoteEngine {
     if (poolAccount == null || vaultAAccount == null || vaultBAccount == null) {
       throw new Error(`Raydium standard refresh missed state for ${pool.descriptor.pool_id}`);
     }
-    if (snapshot.context.slot < pool.provenance.coreStateSlot) return;
+    if (snapshot.context.slot <= pool.provenance.coreStateSlot) {
+      if (snapshot.context.slot === pool.provenance.coreStateSlot) {
+        pool.provenance.noteRpcRefresh();
+        this.refreshesUnchanged += 1;
+      }
+      return;
+    }
     const before = this.poolStateFingerprint(pool);
     if (pool.protocol === "raydium_amm_v4") {
       const state = liquidityStateV4Layout.decode(poolAccount.data);
@@ -782,10 +788,17 @@ export class RaydiumStandardQuoteEngine {
 
   private requestPoolState(
     pool: AttachedPool,
-    fingerprint: string,
+    _reason: string,
     mode: "immediate" | "debounced",
   ): void {
-    pool.stateEmitter.request(fingerprint, mode);
+    const provenance = pool.provenance.fields();
+    pool.stateEmitter.request([
+      this.poolStateFingerprint(pool),
+      provenance.core_state_slot,
+      provenance.dependency_slot_min ?? "",
+      provenance.dependency_slot_max ?? "",
+      provenance.dependency_generation,
+    ].join(":"), mode);
   }
 
   private emitPoolStateNow(pool: AttachedPool): void {

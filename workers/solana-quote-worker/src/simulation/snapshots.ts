@@ -278,13 +278,10 @@ export function raydiumCpmmSnapshotBundle(
     boot_id: bootId,
     model_version: MODEL_VERSION,
     pool_refs: poolRefs,
-    dependency_vector: states.flatMap((state) => state.core_state_slot === undefined ? [] : [{
-      pool_id: canonicalPoolId(state),
-      core_state_slot: state.core_state_slot,
-      dependency_slot_min: state.dependency_slot_min ?? null,
-      dependency_slot_max: state.dependency_slot_max ?? null,
-      dependency_generation: state.dependency_generation ?? 0,
-    }]),
+    // AccountVersion evidence needs address/owner/hash/write-version. Slot
+    // summaries are exposed by the live simulation state and must not be
+    // disguised as dependency-vector evidence.
+    dependency_vector: [],
     pools,
     context_slot: contextSlot,
     chain_consistency: "validated_multi_account_snapshot",
@@ -440,13 +437,7 @@ export function orcaWhirlpoolSnapshotBundle(
     boot_id: bootId,
     model_version: ORCA_MODEL_VERSION,
     pool_refs: poolRefs,
-    dependency_vector: states.flatMap((state) => state.core_state_slot === undefined ? [] : [{
-      pool_id: orcaCanonicalPoolId(state.pool_id),
-      core_state_slot: state.core_state_slot,
-      dependency_slot_min: state.dependency_slot_min ?? null,
-      dependency_slot_max: state.dependency_slot_max ?? null,
-      dependency_generation: state.dependency_generation ?? 0,
-    }]),
+    dependency_vector: [],
     pools,
     context_slot: contextSlot,
     chain_consistency: "validated_multi_account_snapshot",

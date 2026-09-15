@@ -73,3 +73,14 @@ test("separate captures from one worker keep the same source epoch", () => {
   assert.notEqual(first.snapshot_id, second.snapshot_id);
   assert.notEqual(first.context_slot, second.context_slot);
 });
+
+test("slot summaries are not mislabeled as AccountVersion dependency evidence", () => {
+  const bundle = raydiumCpmmSnapshotBundle("boot-provenance", 8, "req-provenance", [{
+    ...state,
+    core_state_slot: 105,
+    dependency_slot_min: 108,
+    dependency_slot_max: 110,
+    dependency_generation: 7,
+  }]);
+  assert.deepEqual(bundle.dependency_vector, []);
+});
