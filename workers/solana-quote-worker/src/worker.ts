@@ -16,6 +16,7 @@ import { RaydiumClmmQuoteEngine } from "./raydiumClmm.js";
 import { MeteoraDlmmQuoteEngine } from "./meteoraDlmm.js";
 import { OrcaWhirlpoolQuoteEngine } from "./orcaWhirlpool.js";
 import { RaydiumStandardQuoteEngine } from "./raydiumStandard.js";
+import type { RaydiumCpmmSimulationCapture } from "./raydiumStandard.js";
 import {
   closeRpcScheduler,
   configureRpcPacer,
@@ -859,6 +860,26 @@ function processSnapshotRequest(
     return schedules;
   }
   const createdAt = monotonicNs();
+  // Compute the snapshot TTL as the minimum of the configured TTL and the
+  // remaining lifetime of the oldest underlying state. Freshness comes from
+  // the real monotonic receipt/validation data, not from capture time.
+  const captures = message.pool_ids.map((poolId) => engine.cpmmSimulationCapture(poolId));
+  const coreReceivedAtNs = Math.min(
+    ...captures.map((c) => Math.round(c.freshness.core_received_at_monotonic_ms * 1_000_000)),
+  );
+  const depTimes = captures
+    .map((c) => c.freshness.dependency_received_at_monotonic_ms)
+    .filter((v): v is number => v !== null);
+  const oldestReceiptNs = Math.min(
+    coreReceivedAtNs,
+    depTimes.length === 0 ? Number.POSITIVE_INFINITY : Math.min(...depTimes.map((v) => Math.round(v * 1_000_000))),
+  );
+  // remainingNs = oldestReceipt + snapshotTtlNs - now
+  // If the oldest state is already stale, fall back to a zero-remaining TTL
+  // so the snapshot is immediately expired rather than dishonestly fresh.
+  const remainingNs = BigInt(oldestReceiptNs) + snapshotTtlNs - createdAt;
+  const effectiveTtlNs = remainingNs > 0n ? remainingNs : 0n;
+  const stateValidUntil = createdAt + effectiveTtlNs;
   const bundle = freezeSnapshot({
     ...raydiumCpmmSnapshotBundle(
       bootId,
@@ -868,7 +889,7 @@ function processSnapshotRequest(
       sourceEpoch,
     ),
     snapshot_created_at_monotonic_ns: createdAt.toString(10),
-    state_valid_until_monotonic_ns: (createdAt + snapshotTtlNs).toString(10),
+    state_valid_until_monotonic_ns: stateValidUntil.toString(10),
   });
   const poolSet = states.map((state) => `solana:mainnet:${state.pool_id}`).sort().join(",");
   const snapshotToken = [

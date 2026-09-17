@@ -2,11 +2,21 @@
 
 import type { RaydiumCpmmSimulationState } from "../raydiumStandard.js";
 
+import { createRequire } from "node:module";
+
 const CPMM_PROGRAM_ID = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 const CHAIN_NAMESPACE = "solana";
 const CHAIN_ID = "mainnet";
 const MODEL_VERSION = "raydium_cpmm_v1";
 const SCHEMA_VERSION = 1;
+
+/** Resolve the actual installed SDK version from package.json metadata. */
+function _installedSdkVersions(): Array<[string, string]> {
+  const require = createRequire(import.meta.url);
+  return [
+    ["@raydium-io/raydium-sdk-v2", require("@raydium-io/raydium-sdk-v2/package.json").version],
+  ];
+}
 
 export interface RaydiumCpmmPoolRef {
   chain_namespace: string;
@@ -36,6 +46,10 @@ export interface RaydiumCpmmPoolBundle {
   protocol_fee_rate: string;
   fund_fee_rate: string;
   fee_on: string;
+  core_state_slot: number;
+  dependency_slot_min: number | null;
+  dependency_slot_max: number | null;
+  dependency_generation: number;
 }
 
 export interface RaydiumCpmmSnapshotBundle {
@@ -268,6 +282,10 @@ export function raydiumCpmmSnapshotBundle(
     protocol_fee_rate: state.protocol_fee_rate,
     fund_fee_rate: state.fund_fee_rate,
     fee_on: state.fee_on.toString(10),
+    core_state_slot: state.core_state_slot ?? state.slot,
+    dependency_slot_min: state.dependency_slot_min ?? null,
+    dependency_slot_max: state.dependency_slot_max ?? null,
+    dependency_generation: state.dependency_generation ?? 0,
   }));
   const contextSlot = states.length === 0 ? 0 : Math.max(...states.map((state) => state.slot));
   return freezeSnapshot({
@@ -285,7 +303,7 @@ export function raydiumCpmmSnapshotBundle(
     pools,
     context_slot: contextSlot,
     chain_consistency: "validated_multi_account_snapshot",
-    sdk_versions: [["@raydium-io/raydium-sdk-v2", "latest"]],
+    sdk_versions: _installedSdkVersions(),
   });
 }
 

@@ -44,6 +44,7 @@ from market_data_lab.realtime_scanner import RealtimeScanner
 from market_data_lab.realtime_scanner import ScannerSource
 from market_data_lab.realtime_scanner import SourceEpochChange
 from market_data_lab.realtime_scanner import TransportReconnectRequired
+from market_data_lab.versioned_market_state import SourceStateRevision
 from market_data_lab.solana_quote_worker import QuoteWorkerPool
 from market_data_lab.solana_quote_worker import RaydiumLocalQuoteWorker
 from market_data_lab.solana_quote_worker import RaydiumStandardQuoteWorkerPool
@@ -1399,6 +1400,10 @@ class RaydiumLocalQuoteStateSource:
                         received_realtime_ns=time.time_ns(),
                         received_monotonic_ns=time.monotonic_ns(),
                         chain_position=slot,
+                        source_revision=SourceStateRevision(
+                            primary_sequence=core_state_slot,
+                            dependency_sequence=dependency_generation,
+                        ),
                     ),
                 )
         finally:

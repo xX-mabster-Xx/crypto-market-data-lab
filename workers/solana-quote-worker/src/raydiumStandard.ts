@@ -27,8 +27,11 @@ import type {
 } from "./protocol.js";
 import {
   coreRefreshDue,
+  coreRefreshOverdueMs,
   DebouncedStateEmitter,
+  FairMaintenanceCursor,
   PoolSlotProvenance,
+  type PoolFreshnessSnapshot,
   type RunRpcJob,
 } from "./engineRuntime.js";
 import { scheduleRpc, sharedRpcFetch } from "./rpcPacer.js";
@@ -121,6 +124,20 @@ export interface RaydiumCpmmSimulationState {
   fund_fee_rate: string;
 }
 
+export interface ImmutableEngineAccountData {
+  readonly address: string;
+  readonly role: "core" | "vault_a" | "vault_b" | "config";
+  readonly slot: number;
+  readonly owner: string;
+  readonly data_base64: string;
+}
+
+export interface RaydiumCpmmSimulationCapture {
+  readonly state: Readonly<RaydiumCpmmSimulationState>;
+  readonly freshness: PoolFreshnessSnapshot;
+  readonly accounts: readonly ImmutableEngineAccountData[];
+}
+
 interface PendingSlot {
   pool?: AccountInfo<Buffer>;
   vaultA?: AccountInfo<Buffer>;
@@ -135,6 +152,12 @@ interface PoolCommon {
   vaultBAddress: PublicKey;
   vaultAAmount: BN;
   vaultBAmount: BN;
+  coreAccountData: Buffer;
+  vaultAAccountData: Buffer;
+  vaultBAccountData: Buffer;
+  coreAccountOwner: PublicKey;
+  vaultAAccountOwner: PublicKey;
+  vaultBAccountOwner: PublicKey;
   provenance: PoolSlotProvenance;
   subscriptionIds: number[];
   pending: Map<number, PendingSlot>;
@@ -151,6 +174,8 @@ interface CpmmPool extends PoolCommon {
   state: CpmmState;
   config: CpmmConfig;
   configAddress: PublicKey;
+  configAccountData: Buffer;
+  configAccountOwner: PublicKey;
 }
 
 type AttachedPool = AmmPool | CpmmPool;
@@ -203,6 +228,9 @@ export class RaydiumStandardQuoteEngine {
   private refreshesStarted = 0;
   private refreshesCompleted = 0;
   private refreshesUnchanged = 0;
+  private readonly maintenanceCursor = new FairMaintenanceCursor();
+  private maintenanceDuePoolCount = 0;
+  private maintenanceMaximumOverdueMs = 0;
 
   public constructor(
     private readonly callbacks: RaydiumStandardEngineCallbacks,
@@ -245,6 +273,42 @@ export class RaydiumStandardQuoteEngine {
   /** Emit a full immutable CPMM snapshot bundle for the requested pool ids. */
   public cpmmSimulationSnapshot(poolIds: readonly string[]): RaydiumCpmmSimulationState[] {
     return poolIds.map((poolId) => this.cpmmSimulationState(poolId));
+  }
+
+  /** Immutable engine handoff for snapshot/evidence serialization. */
+  public cpmmSimulationCapture(poolId: string): RaydiumCpmmSimulationCapture {
+    const pool = this.pools.get(poolId);
+    if (pool === undefined || pool.protocol !== "raydium_cpmm") {
+      throw new Error("Raydium CPMM simulation capture is not available");
+    }
+    const version = (key: string): number => {
+      const slot = pool.provenance.dependencySlot(key);
+      if (slot === undefined) throw new Error(`Raydium CPMM ${poolId} has no ${key} provenance`);
+      return slot;
+    };
+    const item = (
+      address: PublicKey,
+      role: ImmutableEngineAccountData["role"],
+      slot: number,
+      owner: PublicKey,
+      data: Buffer,
+    ): ImmutableEngineAccountData => Object.freeze({
+      address: address.toBase58(),
+      role,
+      slot,
+      owner: owner.toBase58(),
+      data_base64: Buffer.from(data).toString("base64"),
+    });
+    return Object.freeze({
+      state: Object.freeze({ ...this.cpmmSimulationState(poolId) }),
+      freshness: pool.provenance.freshnessSnapshot(),
+      accounts: Object.freeze([
+        item(pool.address, "core", pool.provenance.coreStateSlot, pool.coreAccountOwner, pool.coreAccountData),
+        item(pool.vaultAAddress, "vault_a", version("vault-a"), pool.vaultAAccountOwner, pool.vaultAAccountData),
+        item(pool.vaultBAddress, "vault_b", version("vault-b"), pool.vaultBAccountOwner, pool.vaultBAccountData),
+        item(pool.configAddress, "config", version("config"), pool.configAccountOwner, pool.configAccountData),
+      ]),
+    });
   }
 
   public async open(config: ConfigureMessage): Promise<void> {
@@ -360,17 +424,28 @@ export class RaydiumStandardQuoteEngine {
   }
 
   public async maintainStalePools(nowMs = performance.now()): Promise<void> {
-    for (const pool of this.pools.values()) {
-      if (pool.provenance.refreshInFlight || !coreRefreshDue(
-        pool.provenance,
-        `${pool.protocol}:${pool.descriptor.pool_id}`,
+    const candidates = [...this.pools.values()];
+    const overdue = candidates.map((candidate) => coreRefreshOverdueMs(
+      candidate.provenance,
+      `${candidate.protocol}:${candidate.descriptor.pool_id}`,
+      nowMs,
+      this.coreRefreshAfterMs,
+      this.refreshStaggerWindowMs,
+    ));
+    this.maintenanceDuePoolCount = overdue.filter((value) => value >= 0).length;
+    this.maintenanceMaximumOverdueMs = overdue.reduce((maximum, value) => Math.max(maximum, value), 0);
+    const pool = this.maintenanceCursor.select(
+      candidates,
+      (candidate) => candidate.descriptor.pool_id,
+      (candidate) => !candidate.provenance.refreshInFlight && coreRefreshDue(
+        candidate.provenance,
+        `${candidate.protocol}:${candidate.descriptor.pool_id}`,
         nowMs,
         this.coreRefreshAfterMs,
         this.refreshStaggerWindowMs,
-      )) continue;
-      await this.scheduleCoreRefresh(pool);
-      return;
-    }
+      ),
+    );
+    if (pool !== undefined) await this.scheduleCoreRefresh(pool);
   }
 
   public async quote(request: QuoteRequestMessage): Promise<RaydiumStandardQuoteResult> {
@@ -424,6 +499,12 @@ export class RaydiumStandardQuoteEngine {
       vaultBAddress: state.quoteVault,
       vaultAAmount: decodeVault(vaultAAccount, state.baseMint),
       vaultBAmount: decodeVault(vaultBAccount, state.quoteMint),
+      coreAccountData: Buffer.from(poolAccount.data),
+      vaultAAccountData: Buffer.from(vaultAAccount.data),
+      vaultBAccountData: Buffer.from(vaultBAccount.data),
+      coreAccountOwner: poolAccount.owner,
+      vaultAAccountOwner: vaultAAccount.owner,
+      vaultBAccountOwner: vaultBAccount.owner,
       provenance,
       subscriptionIds: [],
       pending: new Map(),
@@ -459,10 +540,18 @@ export class RaydiumStandardQuoteEngine {
       state,
       config: CpmmConfigInfoLayout.decode(configAccount.data),
       configAddress: shape.configAddress,
+      configAccountData: Buffer.from(configAccount.data),
+      configAccountOwner: configAccount.owner,
       vaultAAddress: state.vaultA,
       vaultBAddress: state.vaultB,
       vaultAAmount: decodeVault(vaultAAccount, state.mintA),
       vaultBAmount: decodeVault(vaultBAccount, state.mintB),
+      coreAccountData: Buffer.from(poolAccount.data),
+      vaultAAccountData: Buffer.from(vaultAAccount.data),
+      vaultBAccountData: Buffer.from(vaultBAccount.data),
+      coreAccountOwner: poolAccount.owner,
+      vaultAAccountOwner: vaultAAccount.owner,
+      vaultBAccountOwner: vaultBAccount.owner,
       provenance,
       subscriptionIds: [],
       pending: new Map(),
@@ -497,17 +586,27 @@ export class RaydiumStandardQuoteEngine {
       pool.subscriptionIds.push(
         connection.onAccountChange(
           pool.configAddress,
-          (account, context) => {
-            if (!pool.provenance.acceptDependency("config", context.slot)) return;
-            pool.config = CpmmConfigInfoLayout.decode(account.data);
-            this.requestPoolState(
-              pool,
-              `dependency:${pool.provenance.dependencyGeneration}`,
-              "debounced",
-            );
-          },
+          (account, context) => this.updateCpmmConfig(pool, account, context),
           "processed",
         ),
+      );
+    }
+  }
+
+  private updateCpmmConfig(pool: CpmmPool, account: AccountInfo<Buffer>, context: Context): void {
+    if (!account.owner.equals(pool.configAccountOwner)) return;
+    const previousSlot = pool.provenance.dependencySlot("config");
+    if (previousSlot !== undefined && context.slot <= previousSlot) return;
+    const config = CpmmConfigInfoLayout.decode(account.data);
+    const changed = !pool.configAccountData.equals(account.data);
+    if (!pool.provenance.acceptDependencyVersion("config", context.slot, changed)) return;
+    pool.config = config;
+    pool.configAccountData = Buffer.from(account.data);
+    if (changed) {
+      this.requestPoolState(
+        pool,
+        `dependency:${pool.provenance.dependencyGeneration}`,
+        "debounced",
       );
     }
   }
@@ -542,22 +641,50 @@ export class RaydiumStandardQuoteEngine {
       pool.pending.delete(slot);
       return;
     }
+    if (!pending.pool.owner.equals(pool.coreAccountOwner)) return;
+    const acceptVaultA = pool.provenance.dependencySlot("vault-a") === undefined
+      || slot > pool.provenance.dependencySlot("vault-a")!;
+    const acceptVaultB = pool.provenance.dependencySlot("vault-b") === undefined
+      || slot > pool.provenance.dependencySlot("vault-b")!;
+    let state: AmmState | CpmmState;
+    let vaultAAmount = pool.vaultAAmount;
+    let vaultBAmount = pool.vaultBAmount;
     if (pool.protocol === "raydium_amm_v4") {
-      const state = liquidityStateV4Layout.decode(pending.pool.data);
+      state = liquidityStateV4Layout.decode(pending.pool.data);
       if (!state.baseVault.equals(pool.vaultAAddress) || !state.quoteVault.equals(pool.vaultBAddress)) return;
-      pool.state = state;
-      pool.vaultAAmount = decodeVault(pending.vaultA, state.baseMint);
-      pool.vaultBAmount = decodeVault(pending.vaultB, state.quoteMint);
+      if (acceptVaultA) vaultAAmount = decodeVault(pending.vaultA, state.baseMint);
+      if (acceptVaultB) vaultBAmount = decodeVault(pending.vaultB, state.quoteMint);
     } else {
-      const state = CpmmPoolInfoLayout.decode(pending.pool.data);
+      state = CpmmPoolInfoLayout.decode(pending.pool.data);
       if (!state.vaultA.equals(pool.vaultAAddress) || !state.vaultB.equals(pool.vaultBAddress)) return;
-      pool.state = state;
-      pool.vaultAAmount = decodeVault(pending.vaultA, state.mintA);
-      pool.vaultBAmount = decodeVault(pending.vaultB, state.mintB);
+      if (acceptVaultA) vaultAAmount = decodeVault(pending.vaultA, state.mintA);
+      if (acceptVaultB) vaultBAmount = decodeVault(pending.vaultB, state.mintB);
     }
+    const coreAccountData = Buffer.from(pending.pool.data);
+    const vaultAAccountData = acceptVaultA ? Buffer.from(pending.vaultA.data) : pool.vaultAAccountData;
+    const vaultBAccountData = acceptVaultB ? Buffer.from(pending.vaultB.data) : pool.vaultBAccountData;
+    const vaultAChanged = acceptVaultA && !pool.vaultAAccountData.equals(vaultAAccountData);
+    const vaultBChanged = acceptVaultB && !pool.vaultBAccountData.equals(vaultBAccountData);
+
+    // All potentially throwing decode/copy work is complete. The following
+    // synchronous commit cannot expose a half-updated state to another task.
     if (!pool.provenance.acceptCore(slot)) return;
-    pool.provenance.acceptDependency("vault-a", slot);
-    pool.provenance.acceptDependency("vault-b", slot);
+    if (acceptVaultA) pool.provenance.acceptDependencyVersion("vault-a", slot, vaultAChanged);
+    if (acceptVaultB) pool.provenance.acceptDependencyVersion("vault-b", slot, vaultBChanged);
+    if (pool.protocol === "raydium_amm_v4") {
+      pool.state = state as AmmState;
+    } else {
+      pool.state = state as CpmmState;
+    }
+    pool.coreAccountData = coreAccountData;
+    if (acceptVaultA) {
+      pool.vaultAAmount = vaultAAmount;
+      pool.vaultAAccountData = vaultAAccountData;
+    }
+    if (acceptVaultB) {
+      pool.vaultBAmount = vaultBAmount;
+      pool.vaultBAccountData = vaultBAccountData;
+    }
     for (const [pendingSlot, item] of pool.pending) {
       if (pendingSlot <= slot) {
         if (item.timer !== undefined) clearTimeout(item.timer);
@@ -726,6 +853,15 @@ export class RaydiumStandardQuoteEngine {
     if (poolAccount == null || vaultAAccount == null || vaultBAccount == null) {
       throw new Error(`Raydium standard refresh missed state for ${pool.descriptor.pool_id}`);
     }
+    if (!poolAccount.owner.equals(pool.coreAccountOwner)
+      || !vaultAAccount.owner.equals(pool.vaultAAccountOwner)
+      || !vaultBAccount.owner.equals(pool.vaultBAccountOwner)) {
+      throw new Error(`Raydium standard refresh owner mismatch for ${pool.descriptor.pool_id}`);
+    }
+    if (pool.protocol === "raydium_cpmm" && configAccount !== null
+      && configAccount !== undefined && !configAccount.owner.equals(pool.configAccountOwner)) {
+      throw new Error(`Raydium CPMM refresh config owner mismatch for ${pool.descriptor.pool_id}`);
+    }
     if (snapshot.context.slot <= pool.provenance.coreStateSlot) {
       if (snapshot.context.slot === pool.provenance.coreStateSlot) {
         pool.provenance.noteRpcRefresh();
@@ -733,15 +869,32 @@ export class RaydiumStandardQuoteEngine {
       }
       return;
     }
-    const before = this.poolStateFingerprint(pool);
+    const snapshotSlot = snapshot.context.slot;
+    const acceptVaultA = pool.provenance.dependencySlot("vault-a") === undefined
+      || snapshotSlot > pool.provenance.dependencySlot("vault-a")!;
+    const acceptVaultB = pool.provenance.dependencySlot("vault-b") === undefined
+      || snapshotSlot > pool.provenance.dependencySlot("vault-b")!;
     if (pool.protocol === "raydium_amm_v4") {
       const state = liquidityStateV4Layout.decode(poolAccount.data);
       if (!state.baseVault.equals(pool.vaultAAddress) || !state.quoteVault.equals(pool.vaultBAddress)) {
         throw new Error(`Raydium AMM v4 ${pool.descriptor.pool_id} changed vault identity`);
       }
+      const vaultAAmount = acceptVaultA ? decodeVault(vaultAAccount, state.baseMint) : pool.vaultAAmount;
+      const vaultBAmount = acceptVaultB ? decodeVault(vaultBAccount, state.quoteMint) : pool.vaultBAmount;
       pool.state = state;
-      pool.vaultAAmount = decodeVault(vaultAAccount, state.baseMint);
-      pool.vaultBAmount = decodeVault(vaultBAccount, state.quoteMint);
+      pool.coreAccountData = Buffer.from(poolAccount.data);
+      if (acceptVaultA) {
+        const changed = !pool.vaultAAccountData.equals(vaultAAccount.data);
+        pool.vaultAAmount = vaultAAmount;
+        pool.vaultAAccountData = Buffer.from(vaultAAccount.data);
+        pool.provenance.acceptDependencyVersion("vault-a", snapshotSlot, changed);
+      }
+      if (acceptVaultB) {
+        const changed = !pool.vaultBAccountData.equals(vaultBAccount.data);
+        pool.vaultBAmount = vaultBAmount;
+        pool.vaultBAccountData = Buffer.from(vaultBAccount.data);
+        pool.provenance.acceptDependencyVersion("vault-b", snapshotSlot, changed);
+      }
     } else {
       if (configAccount == null) {
         throw new Error(`Raydium CPMM refresh missed fee config for ${pool.descriptor.pool_id}`);
@@ -750,17 +903,33 @@ export class RaydiumStandardQuoteEngine {
       if (!state.vaultA.equals(pool.vaultAAddress) || !state.vaultB.equals(pool.vaultBAddress)) {
         throw new Error(`Raydium CPMM ${pool.descriptor.pool_id} changed vault identity`);
       }
+      const acceptConfig = pool.provenance.dependencySlot("config") === undefined
+        || snapshotSlot > pool.provenance.dependencySlot("config")!;
+      const config = acceptConfig ? CpmmConfigInfoLayout.decode(configAccount.data) : pool.config;
+      const vaultAAmount = acceptVaultA ? decodeVault(vaultAAccount, state.mintA) : pool.vaultAAmount;
+      const vaultBAmount = acceptVaultB ? decodeVault(vaultBAccount, state.mintB) : pool.vaultBAmount;
       pool.state = state;
-      pool.config = CpmmConfigInfoLayout.decode(configAccount.data);
-      pool.vaultAAmount = decodeVault(vaultAAccount, state.mintA);
-      pool.vaultBAmount = decodeVault(vaultBAccount, state.mintB);
-      pool.provenance.acceptDependency("config", snapshot.context.slot);
+      pool.coreAccountData = Buffer.from(poolAccount.data);
+      if (acceptConfig) {
+        const changed = !pool.configAccountData.equals(configAccount.data);
+        pool.config = config;
+        pool.configAccountData = Buffer.from(configAccount.data);
+        pool.provenance.acceptDependencyVersion("config", snapshotSlot, changed);
+      }
+      if (acceptVaultA) {
+        const changed = !pool.vaultAAccountData.equals(vaultAAccount.data);
+        pool.vaultAAmount = vaultAAmount;
+        pool.vaultAAccountData = Buffer.from(vaultAAccount.data);
+        pool.provenance.acceptDependencyVersion("vault-a", snapshotSlot, changed);
+      }
+      if (acceptVaultB) {
+        const changed = !pool.vaultBAccountData.equals(vaultBAccount.data);
+        pool.vaultBAmount = vaultBAmount;
+        pool.vaultBAccountData = Buffer.from(vaultBAccount.data);
+        pool.provenance.acceptDependencyVersion("vault-b", snapshotSlot, changed);
+      }
     }
-    if (snapshot.context.slot > pool.provenance.coreStateSlot) {
-      pool.provenance.acceptCore(snapshot.context.slot);
-    }
-    pool.provenance.acceptDependency("vault-a", snapshot.context.slot);
-    pool.provenance.acceptDependency("vault-b", snapshot.context.slot);
+    pool.provenance.acceptCore(snapshotSlot);
     pool.provenance.noteRpcRefresh();
     for (const [slot, pending] of pool.pending) {
       if (slot <= pool.provenance.coreStateSlot) {
@@ -768,11 +937,7 @@ export class RaydiumStandardQuoteEngine {
         pool.pending.delete(slot);
       }
     }
-    if (before !== this.poolStateFingerprint(pool)) {
-      this.requestPoolState(pool, `refresh:${snapshot.context.slot}`, "immediate");
-    } else {
-      this.refreshesUnchanged += 1;
-    }
+    this.requestPoolState(pool, `refresh:${snapshotSlot}`, "immediate");
   }
 
   private poolStateFingerprint(pool: AttachedPool): string {
@@ -842,6 +1007,9 @@ export class RaydiumStandardQuoteEngine {
       refreshes_started_total: this.refreshesStarted,
       refreshes_completed_total: this.refreshesCompleted,
       refreshes_unchanged_total: this.refreshesUnchanged,
+      maintenance_selected_total: this.maintenanceCursor.stats().selected_total,
+      maintenance_due_pool_count: this.maintenanceDuePoolCount,
+      maintenance_maximum_overdue_ms: this.maintenanceMaximumOverdueMs,
     };
   }
 

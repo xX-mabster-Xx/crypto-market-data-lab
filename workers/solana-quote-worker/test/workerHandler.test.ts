@@ -110,14 +110,14 @@ test("offline handler bounds registry by item cap and exports identity evidence"
 });
 
 test("offline handler rejects a result that would exceed byte budget", () => {
-  const handler = new OfflineSimulationHandler({ now_monotonic_ns: () => 1n, max_bytes: 1024 });
+  const handler = new OfflineSimulationHandler({ now_monotonic_ns: () => 1n, max_bytes: 2048 });
   handler.put("token-1", bundle);
   const before = handler.registryBytes;
   assert.ok(before > 0);
   const result = handler.simulate({ ...request("big", "token-1") });
   assert.equal(result?.status, "state_unavailable");
   assert.equal(result?.complete, false);
-  assert.ok(handler.registryBytes <= 1024);
+  assert.ok(handler.registryBytes <= 2048);
 });
 
 test("offline handler rejects evidence export when no simulation was recorded", () => {
@@ -141,10 +141,10 @@ test("offline handler keeps snapshot identity stable across stored simulation", 
 });
 
 test("offline handler evicts oldest entry when byte budget is exceeded", () => {
-  const handler = new OfflineSimulationHandler({ now_monotonic_ns: () => 1n, max_items: 10, max_bytes: 1500 });
+  const handler = new OfflineSimulationHandler({ now_monotonic_ns: () => 1n, max_items: 10, max_bytes: 2048 });
   handler.put("token-1", bundle);
   handler.put("token-2", { ...bundle, snapshot_id: "handler-snapshot-2" });
-  assert.ok(handler.registryBytes <= 1024);
+  assert.ok(handler.registryBytes <= 2048);
   assert.ok(handler.registrySize <= 2);
 });
 

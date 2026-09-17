@@ -14,6 +14,12 @@ export interface PoolSlotProvenanceFields {
   readonly dependency_generation: number;
 }
 
+export interface PoolFreshnessSnapshot extends PoolSlotProvenanceFields {
+  readonly core_received_at_monotonic_ms: number;
+  readonly dependency_received_at_monotonic_ms: number | null;
+  readonly last_successful_rpc_refresh_at_monotonic_ms: number | null;
+}
+
 /**
  * Core and dependency provenance intentionally have different clocks/slots.
  * A tick/bin/vault update can never make the core account look newer.
@@ -50,11 +56,25 @@ export class PoolSlotProvenance {
     slot: number,
     receivedAtMs = performance.now(),
   ): boolean {
+    return this.acceptDependencyVersion(key, slot, true, receivedAtMs);
+  }
+
+  /**
+   * Advance factual account provenance independently from semantic content.
+   * A validation at a newer slot with identical bytes must not manufacture a
+   * new dependency generation or downstream state event.
+   */
+  public acceptDependencyVersion(
+    key: string,
+    slot: number,
+    semanticChange: boolean,
+    receivedAtMs = performance.now(),
+  ): boolean {
     if (!key || !Number.isSafeInteger(slot) || slot < 0) return false;
     const previous = this.dependencySlots.get(key);
     if (previous !== undefined && slot <= previous) return false;
     this.dependencySlots.set(key, slot);
-    this.dependencyGeneration += 1;
+    if (semanticChange) this.dependencyGeneration += 1;
     this.dependencyReceivedAtMs = receivedAtMs;
     return true;
   }
@@ -63,8 +83,25 @@ export class PoolSlotProvenance {
     this.dependencySlots.delete(key);
   }
 
+  public removeDependency(
+    key: string,
+    semanticChange = true,
+    receivedAtMs = performance.now(),
+  ): boolean {
+    if (!this.dependencySlots.delete(key)) return false;
+    if (semanticChange) this.dependencyGeneration += 1;
+    this.dependencyReceivedAtMs = receivedAtMs;
+    return true;
+  }
+
   public dependencySlot(key: string): number | undefined {
     return this.dependencySlots.get(key);
+  }
+
+  public dependencyVersions(): readonly Readonly<{ key: string; slot: number }>[] {
+    return [...this.dependencySlots]
+      .map(([key, slot]) => Object.freeze({ key, slot }))
+      .sort((left, right) => left.key.localeCompare(right.key));
   }
 
   public noteDependencyRefresh(receivedAtMs = performance.now()): void {
@@ -93,6 +130,62 @@ export class PoolSlotProvenance {
       dependency_slot_max: maximum,
       dependency_generation: this.dependencyGeneration,
     };
+  }
+
+  public freshnessSnapshot(): PoolFreshnessSnapshot {
+    return Object.freeze({
+      ...this.fields(),
+      core_received_at_monotonic_ms: this.coreReceivedAtMs,
+      dependency_received_at_monotonic_ms: this.dependencyReceivedAtMs,
+      last_successful_rpc_refresh_at_monotonic_ms: this.lastSuccessfulRpcRefreshAtMs,
+    });
+  }
+}
+
+export interface FairMaintenanceStats {
+  readonly selected_total: number;
+}
+
+/**
+ * Deterministic round-robin selection over a changing keyed collection.
+ * Eligibility remains engine-owned; advancing before I/O ensures one failing
+ * or slow entry cannot be selected again ahead of every later entry.
+ */
+export class FairMaintenanceCursor {
+  private nextStartKey: string | null = null;
+  private fallbackIndex = 0;
+  private selectedTotal = 0;
+
+  public select<T>(
+    values: Iterable<T>,
+    keyOf: (value: T) => string,
+    eligible: (value: T) => boolean,
+  ): T | undefined {
+    const items = [...values];
+    if (items.length === 0) {
+      this.nextStartKey = null;
+      this.fallbackIndex = 0;
+      return undefined;
+    }
+    const requestedIndex = this.nextStartKey === null
+      ? -1
+      : items.findIndex((item) => keyOf(item) === this.nextStartKey);
+    const start = requestedIndex < 0 ? this.fallbackIndex % items.length : requestedIndex;
+    for (let offset = 0; offset < items.length; offset += 1) {
+      const index = (start + offset) % items.length;
+      const item = items[index]!;
+      if (!eligible(item)) continue;
+      const nextIndex = (index + 1) % items.length;
+      this.nextStartKey = keyOf(items[nextIndex]!);
+      this.fallbackIndex = nextIndex;
+      this.selectedTotal += 1;
+      return item;
+    }
+    return undefined;
+  }
+
+  public stats(): FairMaintenanceStats {
+    return { selected_total: this.selectedTotal };
   }
 }
 
@@ -306,9 +399,26 @@ export function coreRefreshDue(
   refreshAfterMs: number,
   staggerWindowMs: number,
 ): boolean {
+  return coreRefreshOverdueMs(
+    provenance,
+    identity,
+    nowMs,
+    refreshAfterMs,
+    staggerWindowMs,
+  ) >= 0;
+}
+
+/** Negative means fresh; zero and above is the factual overdue duration. */
+export function coreRefreshOverdueMs(
+  provenance: PoolSlotProvenance,
+  identity: string,
+  nowMs: number,
+  refreshAfterMs: number,
+  staggerWindowMs: number,
+): number {
   const freshness = Math.max(
     provenance.coreReceivedAtMs,
     provenance.lastSuccessfulRpcRefreshAtMs ?? Number.NEGATIVE_INFINITY,
   );
-  return nowMs >= freshness + refreshAfterMs + deterministicStaggerMs(identity, staggerWindowMs);
+  return nowMs - (freshness + refreshAfterMs + deterministicStaggerMs(identity, staggerWindowMs));
 }

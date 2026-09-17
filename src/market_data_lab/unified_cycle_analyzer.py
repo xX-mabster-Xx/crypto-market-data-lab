@@ -88,6 +88,9 @@ class _ActiveCandidate:
     max_edge_bps: Decimal
     max_pnl_quote: Decimal
     best_cycle: dict[str, Any]
+    # Exact source/epoch pairs used by the candidate.  A source transition
+    # must only close candidates which actually consumed that source.
+    dependencies: frozenset[tuple[str, int]] = frozenset()
 
 
 class UnifiedCycleAnalyzer:
@@ -248,11 +251,15 @@ class UnifiedCycleAnalyzer:
             if provenance is not None and provenance[0] == source and provenance[1] <= old_epoch:
                 if self._remove_quote_key(key):
                     invalidated += 1
-        self._dirty_direct.clear()
-        self._dirty_triangle.clear()
+        # `_remove_quote_key` removes only dirty work belonging to the quote
+        # being invalidated.  Do not clear unrelated route work: a reconnect
+        # of one source must not discard calculations for other sources.
         now_realtime_ns = self._realtime_ns()
         now_monotonic_ns = self._monotonic_ns()
         for key, state in tuple(self._active.items()):
+            if not any(dep_source == source and dep_epoch <= old_epoch
+                       for dep_source, dep_epoch in state.dependencies):
+                continue
             self._active.pop(key)
             self._candidate_closed += 1
             self._persist_candidate_event(
@@ -827,12 +834,71 @@ class UnifiedCycleAnalyzer:
             "max_net_pnl_after_minimum_network_quote": _decimal_text(state.max_pnl_quote),
             "best_cycle": state.best_cycle,
             "execution_blockers": self._execution_blockers(state.best_cycle),
+            "dependencies": [
+                {"source": dep_source, "source_epoch": dep_epoch}
+                for dep_source, dep_epoch in sorted(state.dependencies)
+            ],
         }
         if current_cycle is not None:
             payload["current_cycle"] = dict(current_cycle)
         if close_reason is not None:
             payload["close_reason"] = close_reason
         return payload
+
+    def _candidate_dependencies(self, cycle: Mapping[str, Any]) -> frozenset[tuple[str, int]]:
+        """Resolve the actual source/epoch legs represented by a cycle.
+
+        Source names are deliberately carried as explicit cycle metadata when
+        available.  For legacy cycle calculators, the DEX quote is matched by
+        provider/round/notional against the live cache; guessing from a
+        provider name alone would incorrectly invalidate shared candidates.
+        """
+        dependencies: set[tuple[str, int]] = set()
+
+        def add_pair(value: Mapping[str, Any]) -> None:
+            source = value.get("source")
+            epoch = value.get("source_epoch")
+            if isinstance(source, str) and source and isinstance(epoch, int) and epoch >= 0:
+                dependencies.add((source, epoch))
+
+        def visit(value: object) -> None:
+            if isinstance(value, Mapping):
+                add_pair(value)
+                for child in value.values():
+                    if isinstance(child, Mapping):
+                        visit(child)
+                    elif isinstance(child, list):
+                        for item in child:
+                            visit(item)
+
+        visit(cycle)
+        venue = cycle.get("cex_venue")
+        if isinstance(venue, str):
+            cex = self._spot_cex_sources.get(venue.upper())
+            if cex is not None:
+                dependencies.add((cex.name, cex.source_epoch))
+
+        provider = cycle.get("dex_provider")
+        round_id = cycle.get("round_id")
+        direction = cycle.get("cycle_direction")
+        requested = cycle.get("requested_notional_quote")
+        if isinstance(provider, str):
+            for cache in (self._direct_quotes, self._triangle_quotes):
+                for key, quote in cache.items():
+                    if key[0] != provider:
+                        continue
+                    if round_id is not None and quote.round_id != round_id:
+                        continue
+                    if direction is not None:
+                        expected = "buy_base" if str(direction).startswith("buy_dex") else "sell_base"
+                        if quote.direction != expected:
+                            continue
+                    if requested is not None and _decimal_text(quote.requested_notional_quote) != str(requested):
+                        continue
+                    provenance = self._quote_provenance.get(key)
+                    if provenance is not None:
+                        dependencies.add(provenance)
+        return frozenset(dependencies)
 
     def _persist_candidate_event(self, event: dict[str, Any]) -> None:
         self.analysis_directory.mkdir(parents=True, exist_ok=True)
@@ -906,6 +972,7 @@ class UnifiedCycleAnalyzer:
                 max_edge_bps=edge,
                 max_pnl_quote=pnl,
                 best_cycle=cycle,
+                dependencies=self._candidate_dependencies(cycle),
             )
             self._active[key] = current
             self._candidate_started += 1
@@ -923,6 +990,7 @@ class UnifiedCycleAnalyzer:
         current.last_seen_monotonic_ns = observed_monotonic_ns
         current.last_seen_at = _utc_iso_from_ns(observed_realtime_ns)
         current.observations += 1
+        current.dependencies = self._candidate_dependencies(cycle)
         if edge > current.max_edge_bps:
             current.max_edge_bps = edge
             current.max_pnl_quote = max(current.max_pnl_quote, pnl)

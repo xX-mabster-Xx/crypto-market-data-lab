@@ -217,6 +217,9 @@ class _ActiveCandidate:
     max_pnl_usdt: Decimal
     best_cycle: dict[str, Any]
     persisted: bool
+    # Exact source/epoch pairs used by the candidate.  Epoch changes for an
+    # unrelated feed must not terminate this lifecycle.
+    dependencies: frozenset[tuple[str, int]] = frozenset()
 
 
 class UnifiedPerpAnalyzer:
@@ -395,6 +398,8 @@ class UnifiedPerpAnalyzer:
     @staticmethod
     def _perp_record(perp: _PerpLeg, fee: _Fee) -> dict[str, Any]:
         return {
+            "source": perp.source,
+            "source_epoch": perp.source_epoch,
             "venue": perp.venue,
             "venue_symbol": perp.venue_symbol,
             "base": perp.base,
@@ -425,6 +430,8 @@ class UnifiedPerpAnalyzer:
     @staticmethod
     def _spot_record(spot: _SpotLeg, fee_buy: _Fee, fee_sell: _Fee) -> dict[str, Any]:
         return {
+            "source": spot.source,
+            "source_epoch": spot.source_epoch,
             "venue": spot.venue,
             "symbol": spot.symbol,
             "base": spot.base,
@@ -760,11 +767,19 @@ class UnifiedPerpAnalyzer:
                 return
             raise RuntimeError(f"source epoch regressed for {source!r}: {epoch} < {current}")
         self._current_source_epochs[source] = epoch
+        affected_bases: set[str] = set()
+        for key, quote in tuple(self._dex_quotes.items()):
+            provenance = self._dex_quote_provenance.get(key)
+            if provenance is not None and provenance[0] == source and provenance[1] < epoch:
+                market = self._direct_markets.get(quote.provider)
+                if market is not None:
+                    affected_bases.add(market.cex_base_symbol.upper())
         invalidated_dex = self._purge_dex_source_epoch(source, epoch - 1)
         invalidated_spots = 0
         invalidated_perps = 0
         for key, leg in tuple(self._spots.items()):
             if leg.source == source and leg.source_epoch < epoch:
+                affected_bases.add(leg.base)
                 self._spots.pop(key, None)
                 self._spot_keys_by_base[leg.base].discard(key)
                 if not self._spot_keys_by_base[leg.base]:
@@ -772,11 +787,24 @@ class UnifiedPerpAnalyzer:
                 invalidated_spots += 1
         for key, leg in tuple(self._perps.items()):
             if leg.source == source and leg.source_epoch < epoch:
+                affected_bases.add(leg.base)
                 self._perps.pop(key, None)
                 self._perp_keys_by_base[leg.base].discard(key)
                 if not self._perp_keys_by_base[leg.base]:
                     self._perp_keys_by_base.pop(leg.base, None)
                 invalidated_perps += 1
+        for key, value in self._linear_books.items():
+            if value[1] == source and value[2] < epoch:
+                parsed = _stable_base_and_quote(value[0].symbol)
+                if parsed is not None:
+                    affected_bases.add(parsed[0])
+        for key, value in self._linear_contexts.items():
+            if value[1] == source and value[2] < epoch:
+                symbol = getattr(value[0], "symbol", key[1])
+                if isinstance(symbol, str):
+                    parsed = _stable_base_and_quote(symbol)
+                    if parsed is not None:
+                        affected_bases.add(parsed[0])
         self._linear_books = {
             key: value
             for key, value in self._linear_books.items()
@@ -787,10 +815,14 @@ class UnifiedPerpAnalyzer:
             for key, value in self._linear_contexts.items()
             if not (value[1] == source and value[2] < epoch)
         }
-        self._dirty_bases.clear()
+        # Keep unrelated dirty work.  The removed legs below mark their own
+        # bases so that only affected evaluations are retried.
         now_realtime_ns = self._realtime_ns()
         now_monotonic_ns = self._monotonic_ns()
         for key, state in tuple(self._active.items()):
+            if not any(dep_source == source and dep_epoch < epoch
+                       for dep_source, dep_epoch in state.dependencies):
+                continue
             self._active.pop(key)
             self._candidate_closed += 1
             if state.persisted:
@@ -812,6 +844,7 @@ class UnifiedPerpAnalyzer:
             )
         self._counts["epoch_invalidated_spot_legs"] += invalidated_spots
         self._counts["epoch_invalidated_perp_legs"] += invalidated_perps
+        self._dirty_bases.update(affected_bases)
         self._capabilities_dirty = True
 
     def _remove_dex_quote_key(self, key: tuple[str, str, str]) -> bool:
@@ -2743,6 +2776,32 @@ class UnifiedPerpAnalyzer:
             and edge >= 0
         )
 
+    def _candidate_dependencies(self, cycle: Mapping[str, Any]) -> frozenset[tuple[str, int]]:
+        """Collect source/epoch pairs from every actual strategy leg."""
+        dependencies: set[tuple[str, int]] = set()
+
+        def visit(value: object) -> None:
+            if isinstance(value, Mapping):
+                source = value.get("source")
+                epoch = value.get("source_epoch")
+                if isinstance(source, str) and source and isinstance(epoch, int) and epoch >= 0:
+                    dependencies.add((source, epoch))
+                for child in value.values():
+                    if isinstance(child, Mapping):
+                        visit(child)
+                    elif isinstance(child, list):
+                        for item in child:
+                            visit(item)
+
+        visit(cycle)
+        provider = cycle.get("dex_provider")
+        epoch = cycle.get("dex_source_epoch")
+        if isinstance(provider, str) and isinstance(epoch, int):
+            for key, provenance in self._dex_quote_provenance.items():
+                if key[0] == provider and provenance[1] == epoch:
+                    dependencies.add(provenance)
+        return frozenset(dependencies)
+
     @staticmethod
     def _execution_blockers(cycle: Mapping[str, Any]) -> list[str]:
         blockers = [
@@ -2807,6 +2866,10 @@ class UnifiedPerpAnalyzer:
             "max_net_pnl_after_modeled_costs_usdt": _decimal_text(state.max_pnl_usdt),
             "best_cycle": state.best_cycle,
             "execution_blockers": self._execution_blockers(state.best_cycle),
+            "dependencies": [
+                {"source": dep_source, "source_epoch": dep_epoch}
+                for dep_source, dep_epoch in sorted(state.dependencies)
+            ],
         }
         if current_cycle is not None:
             payload["current_cycle"] = dict(current_cycle)
@@ -2938,6 +3001,8 @@ class UnifiedPerpAnalyzer:
                 if isinstance(item, Mapping)
             ]
         leg_fields = (
+            "source",
+            "source_epoch",
             "venue",
             "venue_symbol",
             "symbol",
@@ -2982,6 +3047,7 @@ class UnifiedPerpAnalyzer:
             "max_net_pnl_after_modeled_costs_usdt",
             "execution_blockers",
             "close_reason",
+            "dependencies",
         )
         result = {field: event[field] for field in fields if field in event}
         for name in ("best_cycle", "current_cycle"):
@@ -3098,6 +3164,7 @@ class UnifiedPerpAnalyzer:
                 max_pnl_usdt=pnl,
                 best_cycle=cycle,
                 persisted=self._candidate_min_persistence_ns == 0,
+                dependencies=self._candidate_dependencies(cycle),
             )
             self._active[key] = current
             self._candidate_started += 1
@@ -3118,6 +3185,7 @@ class UnifiedPerpAnalyzer:
         current.last_seen_monotonic_ns = observed_monotonic_ns
         current.last_seen_at = _utc_iso_from_ns(observed_realtime_ns)
         current.observations += 1
+        current.dependencies = self._candidate_dependencies(cycle)
         improved = edge > current.max_edge_bps
         if improved:
             current.max_edge_bps = edge

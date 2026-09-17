@@ -1,6 +1,7 @@
-/** Bounded, priority-aware start-rate scheduler for Solana HTTP RPC calls. */
+/** Bounded logical RPC admission plus per-physical-request HTTP start pacing. */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { setMaxListeners } from "node:events";
 import { performance } from "node:perf_hooks";
 
 import type { FetchFn, FetchMiddleware } from "@solana/web3.js";
@@ -12,6 +13,7 @@ export interface RpcJobOptions {
   readonly deadlineAtMs?: number;
   readonly coalesceKey?: string;
   readonly description: string;
+  readonly signal?: AbortSignal;
 }
 
 export interface RpcSchedulerMetrics {
@@ -30,9 +32,41 @@ export interface RpcSchedulerMetrics {
   readonly rpc_coalesced_total: number;
   readonly rpc_expired_total: number;
   readonly rpc_rejected_overload_total: number;
+  readonly rpc_cancelled_total: number;
   readonly rpc_queue_wait_average_ms: number;
   readonly rpc_queue_wait_max_ms: number;
   readonly rpc_last_request_start_monotonic_ms: number | null;
+}
+
+export interface RpcRuntimeMetrics extends RpcSchedulerMetrics {
+  readonly rpc_logical_queue_total: number;
+  readonly rpc_logical_active: number;
+  readonly rpc_logical_enqueued_total: number;
+  readonly rpc_logical_started_total: number;
+  readonly rpc_logical_completed_total: number;
+  readonly rpc_logical_failed_total: number;
+  readonly rpc_logical_cancelled_total: number;
+  readonly rpc_logical_coalesced_total: number;
+  readonly rpc_logical_expired_total: number;
+  readonly rpc_logical_rejected_overload_total: number;
+  readonly rpc_physical_queue_total: number;
+  readonly rpc_physical_queue_interactive: number;
+  readonly rpc_physical_queue_bootstrap: number;
+  readonly rpc_physical_queue_refresh: number;
+  readonly rpc_physical_queue_capacity: number;
+  readonly rpc_physical_active: number;
+  readonly rpc_physical_active_capacity: number;
+  readonly rpc_physical_queue_high_watermark: number;
+  readonly rpc_physical_enqueued_total: number;
+  readonly rpc_physical_started_total: number;
+  readonly rpc_physical_completed_total: number;
+  readonly rpc_physical_failed_total: number;
+  readonly rpc_physical_cancelled_total: number;
+  readonly rpc_physical_expired_total: number;
+  readonly rpc_physical_rejected_overload_total: number;
+  readonly rpc_physical_queue_wait_average_ms: number;
+  readonly rpc_physical_queue_wait_max_ms: number;
+  readonly rpc_physical_last_request_start_monotonic_ms: number | null;
 }
 
 export class RpcSchedulerError extends Error {
@@ -77,6 +111,17 @@ export class RpcSchedulerCloseTimeoutError extends RpcSchedulerError {
   }
 }
 
+export class RpcRequestCancelledError extends RpcSchedulerError {
+  public constructor(description: string, reason?: unknown) {
+    super(
+      `RPC request cancelled before completion: ${description}`,
+      "RPC_REQUEST_CANCELLED",
+      reason === undefined ? {} : { cause: reason },
+    );
+    this.name = "RpcRequestCancelledError";
+  }
+}
+
 interface RpcJob {
   options: RpcJobOptions;
   fn: () => Promise<unknown>;
@@ -84,6 +129,7 @@ interface RpcJob {
   readonly promise: Promise<unknown>;
   readonly resolve: (value: unknown) => void;
   readonly reject: (reason: unknown) => void;
+  abortListener?: () => void;
 }
 
 const PRIORITIES: readonly RpcPriority[] = ["interactive", "bootstrap", "refresh"];
@@ -91,7 +137,6 @@ const DEFAULT_MINIMUM_INTERVAL_MS = 200;
 const DEFAULT_MAX_PENDING_JOBS = 256;
 const DEFAULT_MAX_ACTIVE_JOBS = 32;
 const DEFAULT_CLOSE_TIMEOUT_MS = 5_000;
-const scheduledRpcStart = new AsyncLocalStorage<boolean>();
 
 function finiteNonNegative(value: number, name: string): number {
   if (!Number.isFinite(value) || value < 0) {
@@ -119,6 +164,9 @@ function validateOptions(options: RpcJobOptions): void {
   }
   if (options.coalesceKey !== undefined && options.coalesceKey.trim().length === 0) {
     throw new TypeError("RPC coalesce key must be non-empty when supplied");
+  }
+  if (options.coalesceKey !== undefined && options.signal !== undefined) {
+    throw new TypeError("abort signals are not supported on coalesced RPC jobs");
   }
 }
 
@@ -156,6 +204,7 @@ export class RpcScheduler {
   private coalescedTotal = 0;
   private expiredTotal = 0;
   private rejectedOverloadTotal = 0;
+  private cancelledTotal = 0;
   private totalQueueWaitMs = 0;
   private maxQueueWaitMs = 0;
   private lastRequestStartMs: number | null = null;
@@ -186,6 +235,13 @@ export class RpcScheduler {
     validateOptions(options);
     if (!this.accepting) {
       return Promise.reject(new RpcSchedulerClosedError(options.description));
+    }
+    if (options.signal?.aborted === true) {
+      this.cancelledTotal += 1;
+      return Promise.reject(new RpcRequestCancelledError(
+        options.description,
+        options.signal.reason,
+      ));
     }
     const now = this.nowMs();
     this.purgeExpired(now);
@@ -237,6 +293,11 @@ export class RpcScheduler {
     if (options.coalesceKey !== undefined) {
       this.pendingByCoalesceKey.set(options.coalesceKey, job);
     }
+    if (options.signal !== undefined) {
+      const onAbort = (): void => { this.cancelPending(job); };
+      job.abortListener = onAbort;
+      options.signal.addEventListener("abort", onAbort, { once: true });
+    }
     this.enqueuedTotal += 1;
     this.queueHighWatermark = Math.max(this.queueHighWatermark, this.pendingCount());
     this.requestPump();
@@ -267,6 +328,7 @@ export class RpcScheduler {
       rpc_coalesced_total: this.coalescedTotal,
       rpc_expired_total: this.expiredTotal,
       rpc_rejected_overload_total: this.rejectedOverloadTotal,
+      rpc_cancelled_total: this.cancelledTotal,
       rpc_queue_wait_average_ms: this.startedTotal === 0
         ? 0
         : this.totalQueueWaitMs / this.startedTotal,
@@ -275,7 +337,7 @@ export class RpcScheduler {
     };
   }
 
-  /** Stop admission and deterministically drain accepted jobs. */
+  /** Stop admission, then either drain or explicitly reject pending jobs. */
   public async close(options: {
     readonly drain?: boolean;
     readonly timeoutMs?: number;
@@ -373,6 +435,7 @@ export class RpcScheduler {
     for (const priority of PRIORITIES) {
       const job = this.queues[priority].shift();
       if (job === undefined) continue;
+      this.detachAbortListener(job);
       const key = job.options.coalesceKey;
       if (key !== undefined && this.pendingByCoalesceKey.get(key) === job) {
         this.pendingByCoalesceKey.delete(key);
@@ -393,10 +456,7 @@ export class RpcScheduler {
 
     let result: Promise<unknown>;
     try {
-      // An explicitly scheduled job owns this request-start slot. The web3.js
-      // fetch adapter sees this context and does not enqueue the same request
-      // a second time.
-      result = Promise.resolve(scheduledRpcStart.run(true, job.fn));
+      result = Promise.resolve(job.fn());
     } catch (error) {
       result = Promise.reject(error);
     }
@@ -406,7 +466,11 @@ export class RpcScheduler {
         job.resolve(value);
       },
       (error) => {
-        this.failedTotal += 1;
+        if (job.options.signal?.aborted === true) {
+          this.cancelledTotal += 1;
+        } else {
+          this.failedTotal += 1;
+        }
         job.reject(error);
       },
     ).finally(() => {
@@ -421,6 +485,7 @@ export class RpcScheduler {
       const retained: RpcJob[] = [];
       for (const job of this.queues[priority]) {
         if (job.options.deadlineAtMs !== undefined && now >= job.options.deadlineAtMs) {
+          this.detachAbortListener(job);
           const key = job.options.coalesceKey;
           if (key !== undefined && this.pendingByCoalesceKey.get(key) === job) {
             this.pendingByCoalesceKey.delete(key);
@@ -433,6 +498,10 @@ export class RpcScheduler {
       }
       this.queues[priority] = retained;
     }
+    if (this.pendingCount() === 0 && this.startTimer !== null) {
+      clearTimeout(this.startTimer);
+      this.startTimer = null;
+    }
   }
 
   private rejectAllPending(error: RpcSchedulerError): void {
@@ -441,11 +510,43 @@ export class RpcScheduler {
       this.startTimer = null;
     }
     for (const priority of PRIORITIES) {
-      for (const job of this.queues[priority]) job.reject(error);
+      for (const job of this.queues[priority]) {
+        this.detachAbortListener(job);
+        job.reject(error);
+      }
       this.queues[priority] = [];
     }
     this.pendingByCoalesceKey.clear();
     this.resolveIdleWaiters();
+  }
+
+  private cancelPending(job: RpcJob): void {
+    const queue = this.queues[job.options.priority];
+    const index = queue.indexOf(job);
+    if (index < 0) return;
+    queue.splice(index, 1);
+    this.detachAbortListener(job);
+    const key = job.options.coalesceKey;
+    if (key !== undefined && this.pendingByCoalesceKey.get(key) === job) {
+      this.pendingByCoalesceKey.delete(key);
+    }
+    this.cancelledTotal += 1;
+    job.reject(new RpcRequestCancelledError(
+      job.options.description,
+      job.options.signal?.reason,
+    ));
+    if (this.pendingCount() === 0 && this.startTimer !== null) {
+      clearTimeout(this.startTimer);
+      this.startTimer = null;
+    }
+    this.requestPump();
+    this.resolveIdleWaiters();
+  }
+
+  private detachAbortListener(job: RpcJob): void {
+    if (job.abortListener === undefined || job.options.signal === undefined) return;
+    job.options.signal.removeEventListener("abort", job.abortListener);
+    job.abortListener = undefined;
   }
 
   private resolveIdleWaiters(): void {
@@ -462,36 +563,81 @@ function positiveEnvironmentInteger(name: string, fallback: number): number {
   return positiveInteger(Number(raw), name);
 }
 
+function shutdownController(listenerCapacity: number): AbortController {
+  const controller = new AbortController();
+  // One listener per bounded queued/active physical request.  Raising the
+  // EventTarget warning threshold to that exact bound avoids false leak
+  // warnings without turning the shared shutdown signal into an unbounded bag.
+  setMaxListeners(positiveInteger(listenerCapacity, "physical shutdown listener capacity"), controller.signal);
+  return controller;
+}
+
 const rpcContext = new AsyncLocalStorage<RpcJobOptions>();
-let sharedScheduler = new RpcScheduler({
-  maxPendingJobs: positiveEnvironmentInteger(
-    "WORKER_MAX_RPC_PENDING_JOBS",
-    DEFAULT_MAX_PENDING_JOBS,
-  ),
-  maxActiveJobs: positiveEnvironmentInteger(
-    "WORKER_MAX_ACTIVE_RPC_JOBS",
-    DEFAULT_MAX_ACTIVE_JOBS,
-  ),
+const initialPendingCapacity = positiveEnvironmentInteger(
+  "WORKER_MAX_RPC_PENDING_JOBS",
+  DEFAULT_MAX_PENDING_JOBS,
+);
+const initialLogicalActiveCapacity = positiveEnvironmentInteger(
+  "WORKER_MAX_ACTIVE_RPC_JOBS",
+  DEFAULT_MAX_ACTIVE_JOBS,
+);
+const initialPhysicalActiveCapacity = positiveEnvironmentInteger(
+  "WORKER_MAX_ACTIVE_RPC_REQUESTS",
+  initialLogicalActiveCapacity,
+);
+let physicalShutdownController = shutdownController(
+  initialPendingCapacity + initialPhysicalActiveCapacity + 1,
+);
+let sharedLogicalScheduler = new RpcScheduler({
+  minimumIntervalMs: 0,
+  maxPendingJobs: initialPendingCapacity,
+  maxActiveJobs: initialLogicalActiveCapacity,
+});
+let sharedPhysicalScheduler = new RpcScheduler({
+  maxPendingJobs: initialPendingCapacity,
+  maxActiveJobs: initialPhysicalActiveCapacity,
 });
 
 export function configureRpcPacer(
   intervalMs: number | undefined,
   maxPendingJobs?: number,
+  maxActiveLogicalJobs?: number,
+  maxActivePhysicalRequests?: number,
 ): void {
-  const metrics = sharedScheduler.metrics();
-  if (metrics.rpc_queue_total !== 0 || metrics.rpc_active !== 0) {
+  const logical = sharedLogicalScheduler.metrics();
+  const physical = sharedPhysicalScheduler.metrics();
+  if (
+    logical.rpc_queue_total !== 0
+    || logical.rpc_active !== 0
+    || physical.rpc_queue_total !== 0
+    || physical.rpc_active !== 0
+  ) {
     throw new Error("cannot reconfigure RPC scheduler while work is pending or active");
   }
-  sharedScheduler = new RpcScheduler({
+  const pendingCapacity = maxPendingJobs ?? positiveEnvironmentInteger(
+    "WORKER_MAX_RPC_PENDING_JOBS",
+    DEFAULT_MAX_PENDING_JOBS,
+  );
+  const logicalActiveCapacity = maxActiveLogicalJobs ?? positiveEnvironmentInteger(
+    "WORKER_MAX_ACTIVE_RPC_JOBS",
+    DEFAULT_MAX_ACTIVE_JOBS,
+  );
+  const physicalActiveCapacity = maxActivePhysicalRequests ?? positiveEnvironmentInteger(
+    "WORKER_MAX_ACTIVE_RPC_REQUESTS",
+    logicalActiveCapacity,
+  );
+  physicalShutdownController = shutdownController(
+    pendingCapacity + physicalActiveCapacity + 1,
+  );
+  sharedLogicalScheduler = new RpcScheduler({
+    minimumIntervalMs: 0,
+    maxPendingJobs: pendingCapacity,
+    maxActiveJobs: logicalActiveCapacity,
+  });
+  sharedPhysicalScheduler = new RpcScheduler({
     minimumIntervalMs: intervalMs ?? DEFAULT_MINIMUM_INTERVAL_MS,
-    maxPendingJobs: maxPendingJobs ?? positiveEnvironmentInteger(
-      "WORKER_MAX_RPC_PENDING_JOBS",
-      DEFAULT_MAX_PENDING_JOBS,
-    ),
-    maxActiveJobs: positiveEnvironmentInteger(
-      "WORKER_MAX_ACTIVE_RPC_JOBS",
-      DEFAULT_MAX_ACTIVE_JOBS,
-    ),
+    maxPendingJobs: pendingCapacity,
+    maxActiveJobs: physicalActiveCapacity,
   });
 }
 
@@ -499,13 +645,16 @@ export function scheduleRpc<T>(
   options: RpcJobOptions,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return sharedScheduler.scheduleRpc(options, fn);
+  return sharedLogicalScheduler.scheduleRpc(
+    options,
+    () => rpcContext.run(options, fn),
+  );
 }
 
 /** Stable facade: engines may capture it before configureRpcPacer replaces the implementation. */
 export const sharedRpcScheduler = {
   schedule<T>(options: RpcJobOptions, fn: () => Promise<T>): Promise<T> {
-    return sharedScheduler.scheduleRpc(options, fn);
+    return scheduleRpc(options, fn);
   },
 };
 
@@ -514,12 +663,53 @@ export function withRpcJobOptions<T>(options: RpcJobOptions, fn: () => T): T {
   return rpcContext.run(options, fn);
 }
 
-export function rpcSchedulerMetrics(): RpcSchedulerMetrics {
-  return sharedScheduler.metrics();
+/**
+ * Legacy unprefixed fields retain logical-scheduler semantics.  Consumers
+ * auditing the wire budget must use the explicit `rpc_physical_*` fields.
+ */
+export function rpcSchedulerMetrics(): RpcRuntimeMetrics {
+  const logical = sharedLogicalScheduler.metrics();
+  const physical = sharedPhysicalScheduler.metrics();
+  return {
+    ...logical,
+    rpc_logical_queue_total: logical.rpc_queue_total,
+    rpc_logical_active: logical.rpc_active,
+    rpc_logical_enqueued_total: logical.rpc_enqueued_total,
+    rpc_logical_started_total: logical.rpc_started_total,
+    rpc_logical_completed_total: logical.rpc_completed_total,
+    rpc_logical_failed_total: logical.rpc_failed_total,
+    rpc_logical_cancelled_total: logical.rpc_cancelled_total,
+    rpc_logical_coalesced_total: logical.rpc_coalesced_total,
+    rpc_logical_expired_total: logical.rpc_expired_total,
+    rpc_logical_rejected_overload_total: logical.rpc_rejected_overload_total,
+    rpc_physical_queue_total: physical.rpc_queue_total,
+    rpc_physical_queue_interactive: physical.rpc_queue_interactive,
+    rpc_physical_queue_bootstrap: physical.rpc_queue_bootstrap,
+    rpc_physical_queue_refresh: physical.rpc_queue_refresh,
+    rpc_physical_queue_capacity: physical.rpc_queue_capacity,
+    rpc_physical_active: physical.rpc_active,
+    rpc_physical_active_capacity: physical.rpc_active_capacity,
+    rpc_physical_queue_high_watermark: physical.rpc_queue_high_watermark,
+    rpc_physical_enqueued_total: physical.rpc_enqueued_total,
+    rpc_physical_started_total: physical.rpc_started_total,
+    rpc_physical_completed_total: physical.rpc_completed_total,
+    rpc_physical_failed_total: physical.rpc_failed_total,
+    rpc_physical_cancelled_total: physical.rpc_cancelled_total,
+    rpc_physical_expired_total: physical.rpc_expired_total,
+    rpc_physical_rejected_overload_total: physical.rpc_rejected_overload_total,
+    rpc_physical_queue_wait_average_ms: physical.rpc_queue_wait_average_ms,
+    rpc_physical_queue_wait_max_ms: physical.rpc_queue_wait_max_ms,
+    rpc_physical_last_request_start_monotonic_ms:
+      physical.rpc_last_request_start_monotonic_ms,
+  };
 }
 
 export async function closeRpcScheduler(timeoutMs = DEFAULT_CLOSE_TIMEOUT_MS): Promise<void> {
-  await sharedScheduler.close({ timeoutMs });
+  physicalShutdownController.abort(new RpcSchedulerClosedError("physical transport shutdown"));
+  await Promise.all([
+    sharedLogicalScheduler.close({ drain: false, timeoutMs }),
+    sharedPhysicalScheduler.close({ drain: false, timeoutMs }),
+  ]);
 }
 
 function currentRpcOptions(): RpcJobOptions {
@@ -529,26 +719,83 @@ function currentRpcOptions(): RpcJobOptions {
   };
 }
 
-/** Production fetch path: overload/deadline errors reject the actual RPC Promise. */
-export const sharedRpcFetch: FetchFn = (info, init) => scheduledRpcStart.getStore() === true
-  ? globalThis.fetch(info, init)
-  : sharedScheduler.scheduleRpc(
-    currentRpcOptions(),
-    () => globalThis.fetch(info, init),
+function physicalSignal(callerSignal: AbortSignal | null | undefined): AbortSignal {
+  return callerSignal === null || callerSignal === undefined
+    ? physicalShutdownController.signal
+    : AbortSignal.any([callerSignal, physicalShutdownController.signal]);
+}
+
+function physicalOptions(
+  options: RpcJobOptions,
+  signal: AbortSignal,
+): RpcJobOptions {
+  return {
+    priority: options.priority,
+    ...(options.deadlineAtMs === undefined ? {} : { deadlineAtMs: options.deadlineAtMs }),
+    description: `physical HTTP request for ${options.description}`,
+    signal,
+  };
+}
+
+async function rawFetchWithCancellation(
+  info: Parameters<FetchFn>[0],
+  init: Parameters<FetchFn>[1],
+  signal: AbortSignal,
+  description: string,
+): Promise<Response> {
+  if (signal.aborted) {
+    throw new RpcRequestCancelledError(description, signal.reason);
+  }
+  return new Promise<Response>((resolve, reject) => {
+    let settled = false;
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const onAbort = (): void => {
+      finish(() => { reject(new RpcRequestCancelledError(description, signal.reason)); });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    let request: Promise<Response>;
+    try {
+      request = globalThis.fetch(info, { ...init, signal });
+    } catch (error) {
+      finish(() => { reject(error); });
+      return;
+    }
+    void request.then(
+      (response) => { finish(() => { resolve(response); }); },
+      (error: unknown) => { finish(() => { reject(error); }); },
+    );
+  });
+}
+
+/** Production fetch path: every physical attempt passes through this bounded gate. */
+export const sharedRpcFetch: FetchFn = (info, init) => {
+  const options = currentRpcOptions();
+  const signal = physicalSignal(init?.signal);
+  const requestOptions = physicalOptions(options, signal);
+  return sharedPhysicalScheduler.scheduleRpc(
+    requestOptions,
+    () => rawFetchWithCancellation(info, init, signal, requestOptions.description),
   );
+};
 
 /**
  * Compatibility adapter for external engine code still accepting middleware.
  * Production engines use `sharedRpcFetch`, which can propagate typed errors.
  */
 export const sharedRpcFetchMiddleware: FetchMiddleware = (info, init, next) => {
-  if (scheduledRpcStart.getStore() === true) {
-    next(info, init);
-    return;
-  }
-  void sharedScheduler.scheduleRpc(currentRpcOptions(), async () => {
-    next(info, init);
+  const signal = physicalSignal(init?.signal);
+  const requestOptions = physicalOptions(currentRpcOptions(), signal);
+  let started = false;
+  void sharedPhysicalScheduler.scheduleRpc(requestOptions, async () => {
+    started = true;
+    next(info, { ...init, signal });
   }).catch((error: unknown) => {
+    if (started) return;
     const controller = new AbortController();
     controller.abort(error);
     next(info, { ...init, signal: controller.signal });

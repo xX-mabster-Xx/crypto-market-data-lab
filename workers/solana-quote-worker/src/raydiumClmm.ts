@@ -22,7 +22,9 @@ import {
 import type { ConfigureMessage, PoolDescriptor, QuoteRequestMessage } from "./protocol.js";
 import {
   coreRefreshDue,
+  coreRefreshOverdueMs,
   DebouncedStateEmitter,
+  FairMaintenanceCursor,
   LatestOnlyMailbox,
   PoolSlotProvenance,
   type RunRpcJob,
@@ -177,6 +179,9 @@ export class RaydiumClmmQuoteEngine {
   private refreshesStarted = 0;
   private refreshesCompleted = 0;
   private refreshesUnchanged = 0;
+  private readonly maintenanceCursor = new FairMaintenanceCursor();
+  private maintenanceDuePoolCount = 0;
+  private maintenanceMaximumOverdueMs = 0;
 
   public constructor(
     private readonly callbacks: RaydiumEngineCallbacks,
@@ -236,17 +241,28 @@ export class RaydiumClmmQuoteEngine {
   }
 
   public async maintainStalePools(nowMs = performance.now()): Promise<void> {
-    for (const pool of this.pools.values()) {
-      if (pool.provenance.refreshInFlight || !coreRefreshDue(
-        pool.provenance,
-        `raydium-clmm:${pool.descriptor.pool_id}`,
+    const candidates = [...this.pools.values()];
+    const overdue = candidates.map((candidate) => coreRefreshOverdueMs(
+      candidate.provenance,
+      `raydium-clmm:${candidate.descriptor.pool_id}`,
+      nowMs,
+      this.coreRefreshAfterMs,
+      this.refreshStaggerWindowMs,
+    ));
+    this.maintenanceDuePoolCount = overdue.filter((value) => value >= 0).length;
+    this.maintenanceMaximumOverdueMs = overdue.reduce((maximum, value) => Math.max(maximum, value), 0);
+    const pool = this.maintenanceCursor.select(
+      candidates,
+      (candidate) => candidate.descriptor.pool_id,
+      (candidate) => !candidate.provenance.refreshInFlight && coreRefreshDue(
+        candidate.provenance,
+        `raydium-clmm:${candidate.descriptor.pool_id}`,
         nowMs,
         this.coreRefreshAfterMs,
         this.refreshStaggerWindowMs,
-      )) continue;
-      await this.scheduleCoreRefresh(pool);
-      return;
-    }
+      ),
+    );
+    if (pool !== undefined) await this.scheduleCoreRefresh(pool);
   }
 
   public async quote(request: QuoteRequestMessage): Promise<QuoteResult> {
@@ -304,7 +320,7 @@ export class RaydiumClmmQuoteEngine {
         pool_fee_raw: result.fee.raw.toString(10),
         price_impact_pct: result.priceImpact.toFixed(8),
         all_trade: result.allTrade,
-        tick_cache_age_ms: Math.max(0, Date.now() - pool.tickCacheAtMs),
+        tick_cache_age_ms: Math.max(0, performance.now() - pool.tickCacheAtMs),
         chain_time_age_ms: chainTimeAgeMs,
       };
     } catch (error) {
@@ -345,7 +361,7 @@ export class RaydiumClmmQuoteEngine {
       compute,
       coreAccountData: Buffer.from(account.value.data),
       tickCache,
-      tickCacheAtMs: Date.now(),
+      tickCacheAtMs: performance.now(),
       currentTickArray: currentTickArray(compute.tickCurrent, compute.tickSpacing),
       provenance,
       subscriptionId: -1,
@@ -426,7 +442,7 @@ export class RaydiumClmmQuoteEngine {
   }
 
   private async ensureTickCache(pool: AttachedPool, force: boolean): Promise<void> {
-    const ageMs = Date.now() - pool.tickCacheAtMs;
+    const ageMs = performance.now() - pool.tickCacheAtMs;
     if (!force && ageMs <= this.tickCacheMaxAgeMs) return;
     if (pool.tickRefresh !== undefined) return pool.tickRefresh;
     const connection = this.requireConnection();
@@ -465,7 +481,7 @@ export class RaydiumClmmQuoteEngine {
           if (!decoded.poolId.equals(pool.publicKey)) return;
           if (!pool.provenance.acceptDependency(key, context.slot)) return;
           pool.tickCache[String(decoded.startTickIndex)] = { ...decoded, address };
-          pool.tickCacheAtMs = Date.now();
+          pool.tickCacheAtMs = performance.now();
           this.requestPoolState(
             pool,
             `dependency:${pool.provenance.dependencyGeneration}`,
@@ -502,7 +518,7 @@ export class RaydiumClmmQuoteEngine {
     for (const [index, array] of Object.entries(pool.tickCache)) {
       if (!wanted.has(array.address.toBase58())) delete pool.tickCache[index];
     }
-    pool.tickCacheAtMs = Date.now();
+    pool.tickCacheAtMs = performance.now();
     pool.provenance.noteDependencyRefresh();
     if (hadSubscriptions && pool.provenance.dependencyGeneration !== generationBefore) {
       this.requestPoolState(
@@ -653,7 +669,9 @@ export class RaydiumClmmQuoteEngine {
       token_a_decimals: pool.compute.mintA.decimals,
       token_b_decimals: pool.compute.mintB.decimals,
       sqrt_price_x64: pool.compute.sqrtPriceX64.toString(10),
-      tick_cache_age_ms: pool.tickCacheAtMs === 0 ? null : Math.max(0, Date.now() - pool.tickCacheAtMs),
+      tick_cache_age_ms: pool.tickCacheAtMs === 0
+        ? null
+        : Math.max(0, performance.now() - pool.tickCacheAtMs),
       ...pool.provenance.fields(),
     });
   }
@@ -686,6 +704,9 @@ export class RaydiumClmmQuoteEngine {
       refreshes_started_total: this.refreshesStarted,
       refreshes_completed_total: this.refreshesCompleted,
       refreshes_unchanged_total: this.refreshesUnchanged,
+      maintenance_selected_total: this.maintenanceCursor.stats().selected_total,
+      maintenance_due_pool_count: this.maintenanceDuePoolCount,
+      maintenance_maximum_overdue_ms: this.maintenanceMaximumOverdueMs,
     };
   }
 

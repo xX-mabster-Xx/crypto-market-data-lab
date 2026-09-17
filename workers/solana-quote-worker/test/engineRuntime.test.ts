@@ -189,6 +189,23 @@ test("BUG-020 dependency slot cannot impersonate or block a newer core slot", ()
   assert.equal(provenance.fields().dependency_slot_max, 120);
 });
 
+test("BUG-020 factual dependency validation is monotonic without inventing semantic generations", () => {
+  const provenance = new PoolSlotProvenance(100, 1_000);
+  assert.equal(provenance.acceptDependencyVersion("config", 110, true, 1_100), true);
+  assert.equal(provenance.acceptDependencyVersion("config", 120, false, 1_200), true);
+  assert.equal(provenance.dependencySlot("config"), 120);
+  assert.equal(provenance.dependencyGeneration, 1);
+  assert.equal(provenance.acceptDependencyVersion("config", 120, true, 1_300), false);
+  assert.equal(provenance.removeDependency("config", true, 1_400), true);
+  assert.equal(provenance.dependencyGeneration, 2);
+  assert.equal(provenance.dependencySlot("config"), undefined);
+
+  const snapshot = provenance.freshnessSnapshot();
+  assert.ok(Object.isFrozen(snapshot));
+  assert.equal(snapshot.core_received_at_monotonic_ms, 1_000);
+  assert.equal(snapshot.dependency_received_at_monotonic_ms, 1_400);
+});
+
 test("BUG-023 fresh pools are skipped and deterministic staggering spreads stale pools", () => {
   const fresh = new PoolSlotProvenance(100, 10_000);
   assert.equal(coreRefreshDue(fresh, "pool-a", 12_000, 15_000, 5_000), false);

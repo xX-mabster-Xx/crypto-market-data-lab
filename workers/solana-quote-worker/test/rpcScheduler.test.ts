@@ -227,7 +227,10 @@ test("an explicitly scheduled production RPC is not scheduled twice by shared fe
     );
     assert.equal(response.status, 200);
     assert.equal(rawFetches, 1);
-    assert.equal(rpcSchedulerMetrics().rpc_started_total, 1);
+    const metrics = rpcSchedulerMetrics();
+    assert.equal(metrics.rpc_started_total, 1);
+    assert.equal(metrics.rpc_logical_started_total, 1);
+    assert.equal(metrics.rpc_physical_started_total, 1);
     await closeRpcScheduler();
   } finally {
     globalThis.fetch = originalFetch;

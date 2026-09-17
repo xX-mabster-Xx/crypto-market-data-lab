@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { RaydiumCpmmSimulationState } from "../src/raydiumStandard.js";
+import { createRequire } from "node:module";
 import { raydiumCpmmSnapshotBundle } from "../src/simulation/snapshots.js";
 
 const state: RaydiumCpmmSimulationState = {
@@ -46,7 +47,11 @@ test("raydium CPMM snapshot bundle matches the Python canonical shape", () => {
   assert.equal(bundle.pools[0].vault_a_raw, "1000005000");
   assert.equal(bundle.pools[0].protocol_fees_a_raw, "1000");
   assert.equal(bundle.pools[0].fee_on, "0");
-  assert.deepEqual(bundle.sdk_versions[0], ["@raydium-io/raydium-sdk-v2", "latest"]);
+  assert.equal(bundle.sdk_versions[0][0], "@raydium-io/raydium-sdk-v2");
+  assert.notEqual(bundle.sdk_versions[0][1], "latest");
+  // SDK version must match the actually installed package.json metadata, not a hardcoded string
+  const pkg = (createRequire(import.meta.url))("../package.json");
+  assert.equal(bundle.sdk_versions[0][1], pkg.dependencies["@raydium-io/raydium-sdk-v2"]);
 });
 
 test("snapshot bundle keeps deterministic invariants for multiple pools", () => {

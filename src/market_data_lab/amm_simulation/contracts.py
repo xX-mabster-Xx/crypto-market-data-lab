@@ -163,6 +163,10 @@ class RaydiumCpmmPoolBody:
     protocol_fee_rate: int
     fund_fee_rate: int
     fee_on: int
+    core_state_slot: int = 0
+    dependency_slot_min: int | None = None
+    dependency_slot_max: int | None = None
+    dependency_generation: int = 0
 
     @property
     def economic_projection(self) -> dict[str, str | int]:
@@ -183,6 +187,10 @@ class RaydiumCpmmPoolBody:
             "protocol_fee_rate": str(self.protocol_fee_rate),
             "fund_fee_rate": str(self.fund_fee_rate),
             "fee_on": str(self.fee_on),
+            "core_state_slot": self.core_state_slot,
+            "dependency_slot_min": self.dependency_slot_min,
+            "dependency_slot_max": self.dependency_slot_max,
+            "dependency_generation": self.dependency_generation,
         }
 
     def effective_reserves(self) -> tuple[int, int]:
@@ -202,6 +210,18 @@ class RaydiumCpmmPoolBody:
         _raw(self.fund_fee_rate, "fund_fee_rate")
         if self.fund_fee_rate > self.trade_fee_rate:
             raise ValueError("Raydium CPMM fund fee rate must not exceed trade fee rate")
+        _raw(self.core_state_slot, "core_state_slot")
+        if self.dependency_slot_min is not None:
+            _raw(self.dependency_slot_min, "dependency_slot_min")
+        if self.dependency_slot_max is not None:
+            _raw(self.dependency_slot_max, "dependency_slot_max")
+        _raw(self.dependency_generation, "dependency_generation")
+        if (
+            self.dependency_slot_min is not None
+            and self.dependency_slot_max is not None
+            and self.dependency_slot_min > self.dependency_slot_max
+        ):
+            raise ValueError("dependency_slot_min must not exceed dependency_slot_max")
 
 
 

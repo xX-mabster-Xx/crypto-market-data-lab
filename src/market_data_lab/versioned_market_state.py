@@ -30,8 +30,10 @@ IntegrityStatus = Literal["valid", "invalid"]
 PutStatus = Literal[
     "accepted",
     "duplicate_event",
+    "duplicate_source_revision",
     "duplicate_source_sequence",
     "stale_source_epoch",
+    "out_of_order_source_revision",
     "out_of_order_source_sequence",
     "out_of_order_receipt",
     "boot_id_mismatch",
@@ -41,6 +43,26 @@ PutStatus = Literal[
 def _require_text(value: str, name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class SourceStateRevision:
+    """A source-local composite revision ordered within one source epoch.
+
+    ``primary_sequence`` is the authoritative sequence of the core state.
+    ``dependency_sequence`` advances when dependencies used by that state
+    change without moving the core sequence.  Lexicographic ordering rejects
+    an older core state even if it advertises a larger dependency sequence.
+    """
+
+    primary_sequence: int
+    dependency_sequence: int
+
+    def __post_init__(self) -> None:
+        for name in ("primary_sequence", "dependency_sequence"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +83,7 @@ class EventEnvelope:
     exchange_event_time_ns: int | None = None
     exchange_event_time_semantics: str | None = None
     source_sequence: int | None = None
+    source_revision: SourceStateRevision | None = None
     block_number: int | None = None
     block_hash: str | None = None
     slot: int | None = None
@@ -88,6 +111,13 @@ class EventEnvelope:
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative when present")
+        if self.source_revision is not None:
+            if not isinstance(self.source_revision, SourceStateRevision):
+                raise ValueError("source_revision must be a SourceStateRevision")
+            if self.source_sequence != self.source_revision.primary_sequence:
+                raise ValueError(
+                    "source_sequence must equal source_revision.primary_sequence",
+                )
         if any(not isinstance(flag, str) or not flag for flag in self.quality_flags):
             raise ValueError("quality_flags must contain non-empty strings")
         if self.diagnostic is not None and len(self.diagnostic) > 512:
@@ -235,7 +265,24 @@ class VersionedMarketState:
                 event.source_id == previous.source_id
                 and event.source_epoch == previous.source_epoch
             ):
-                if event.source_sequence is not None and previous.source_sequence is not None:
+                if event.source_revision is not None and previous.source_revision is not None:
+                    if event.source_revision == previous.source_revision:
+                        self._counts["duplicate_source_revision"] += 1
+                        return PutResult(
+                            False,
+                            "duplicate_source_revision",
+                            current,
+                            invalidated,
+                        )
+                    if event.source_revision < previous.source_revision:
+                        self._counts["out_of_order_source_revision"] += 1
+                        return PutResult(
+                            False,
+                            "out_of_order_source_revision",
+                            current,
+                            invalidated,
+                        )
+                elif event.source_sequence is not None and previous.source_sequence is not None:
                     if event.source_sequence == previous.source_sequence:
                         self._counts["duplicate_source_sequence"] += 1
                         return PutResult(

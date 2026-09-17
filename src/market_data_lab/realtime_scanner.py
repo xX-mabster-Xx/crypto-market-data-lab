@@ -24,6 +24,7 @@ from typing import Any, Literal, Protocol
 
 from market_data_lab.live_common import atomic_json
 from market_data_lab.versioned_market_state import EventEnvelope
+from market_data_lab.versioned_market_state import SourceStateRevision
 from market_data_lab.versioned_market_state import VersionedMarketState
 
 
@@ -54,6 +55,7 @@ class MarketEvent:
     received_realtime_ns: int
     received_monotonic_ns: int
     chain_position: int | None = None
+    source_revision: SourceStateRevision | None = None
     event_id: str | None = None
     schema_version: int = 2
     source_epoch: int = 0
@@ -82,6 +84,7 @@ class MarketEvent:
             received_monotonic_ns=self.received_monotonic_ns,
             boot_id=self.boot_id or default_boot_id,
             source_sequence=self.chain_position,
+            source_revision=self.source_revision,
             payload=self.value,
             exchange_event_time_ns=self.exchange_event_time_ns,
             exchange_event_time_semantics=self.exchange_event_time_semantics,
@@ -235,6 +238,7 @@ class RollingStateStore:
         # contract permits them to differ.  Keep an explicit bounded index so
         # history-only entries can also be retired after an epoch boundary.
         self._state_key_by_event_key: dict[str, str] = {}
+        self._event_keys_by_state_key: dict[str, set[str]] = {}
         self.max_state_keys = max_state_keys
         self._total_updates = 0
         self._discarded_by_retention = 0
@@ -268,37 +272,57 @@ class RollingStateStore:
         """Remove a versioned state and every local key that indexes it."""
 
         removed: list[str] = []
-        for event_key, indexed_key in tuple(self._state_key_by_event_key.items()):
-            if indexed_key != state_key or event_key == keep_event_key:
+        for event_key in sorted(self._event_keys_by_state_key.get(state_key, ())):
+            if event_key == keep_event_key:
                 continue
-            self._state_key_by_event_key.pop(event_key, None)
+            self._unlink_event_key(event_key)
             self._latest.pop(event_key, None)
             self._history.pop(event_key, None)
             removed.append(event_key)
-        # Defensive fallback for stores created before the explicit index was
-        # introduced or for diagnostic data populated by a custom adapter.
-        for event_key, latest in tuple(self._latest.items()):
-            indexed_key = latest.instrument_or_pool_id or event_key
-            if indexed_key == state_key and event_key != keep_event_key:
-                self._state_key_by_event_key.pop(event_key, None)
-                self._latest.pop(event_key, None)
-                self._history.pop(event_key, None)
-                removed.append(event_key)
         if keep_event_key is None:
             self._history.pop(state_key, None)
-        if state_key not in self._state_key_by_event_key.values():
+        if state_key not in self._event_keys_by_state_key:
             self._versioned.retire(state_key)
         return tuple(removed)
+
+    def _link_event_key(self, event_key: str, state_key: str) -> None:
+        """Install both directions of the event-key/state-key index."""
+
+        previous_state_key = self._state_key_by_event_key.get(event_key)
+        if previous_state_key == state_key:
+            self._event_keys_by_state_key.setdefault(state_key, set()).add(event_key)
+            return
+        if previous_state_key is not None:
+            previous_keys = self._event_keys_by_state_key.get(previous_state_key)
+            if previous_keys is not None:
+                previous_keys.discard(event_key)
+                if not previous_keys:
+                    self._event_keys_by_state_key.pop(previous_state_key, None)
+        self._state_key_by_event_key[event_key] = state_key
+        self._event_keys_by_state_key.setdefault(state_key, set()).add(event_key)
+
+    def _unlink_event_key(self, event_key: str) -> str | None:
+        """Remove both directions of one event-key/state-key mapping."""
+
+        state_key = self._state_key_by_event_key.pop(event_key, None)
+        if state_key is None:
+            return None
+        event_keys = self._event_keys_by_state_key.get(state_key)
+        if event_keys is not None:
+            event_keys.discard(event_key)
+            if not event_keys:
+                self._event_keys_by_state_key.pop(state_key, None)
+        return state_key
 
     def _retire_event_key(self, event_key: str) -> None:
         """Retire one local key without deleting a shared state record."""
 
-        state_key = self._state_key_by_event_key.pop(event_key, None)
+        state_key = self._unlink_event_key(event_key)
         latest = self._latest.pop(event_key, None)
         self._history.pop(event_key, None)
         if state_key is None and latest is not None:
             state_key = latest.instrument_or_pool_id or event_key
-        if state_key is not None and state_key not in self._state_key_by_event_key.values():
+        if state_key is not None and state_key not in self._event_keys_by_state_key:
             self._versioned.retire(state_key)
 
     def _evict_oldest_for_capacity(self) -> None:
@@ -327,7 +351,7 @@ class RollingStateStore:
         # Install the mapping before eviction.  A new event key may share an
         # existing state key; eviction must not retire the record just
         # accepted by ``VersionedMarketState.put``.
-        self._state_key_by_event_key[event.key] = envelope.state_key
+        self._link_event_key(event.key, envelope.state_key)
         self._retire_state_key(envelope.state_key, keep_event_key=event.key)
         if event.key not in self._latest:
             self._evict_oldest_for_capacity()
@@ -468,6 +492,10 @@ class PublishResult:
     coalesced: bool = False
 
 
+class EventBusClosed(RuntimeError):
+    """Raised when a publisher or consumer waits on a closed event bus."""
+
+
 class CoalescingEventBus:
     """A bounded event queue which coalesces by state key with backpressure.
 
@@ -491,41 +519,76 @@ class CoalescingEventBus:
         self.pending_keys = 0
         self.queue_high_watermark = 0
         self.publisher_backpressure_waits = 0
+        self.waiting_publishers = 0
+        self._closed = False
 
     @property
     def queued(self) -> int:
         return len(self._pending_latest)
 
     async def publish(self, event: MarketEvent) -> PublishResult:
-        accepted = self.store.add(event)
-        if not accepted:
-            self.rejected_state_events += 1
-            return PublishResult(accepted=False)
         async with self._condition:
-            if event.key in self._pending_latest:
-                self._pending_latest[event.key] = event
-                self.coalesced_updates += 1
-                self._condition.notify_all()
-                return PublishResult(accepted=True, coalesced=True)
-            while len(self._pending_latest) >= self.capacity:
+            if self._closed:
+                raise EventBusClosed("event bus is closed")
+            accepted = self.store.add(event)
+            if not accepted:
+                self.rejected_state_events += 1
+                return PublishResult(accepted=False)
+            while True:
+                if self._closed:
+                    raise EventBusClosed("event bus is closed")
+                latest = self.store.latest(event.key)
+                if latest is None:
+                    # A retention/epoch operation retired the accepted state
+                    # while this publisher was backpressured.
+                    return PublishResult(accepted=True, coalesced=True)
+                superseded = latest is not event
+                if event.key in self._pending_latest:
+                    pending = self._pending_latest[event.key]
+                    if pending is not latest:
+                        self._pending_latest[event.key] = latest
+                    if superseded or pending is not latest:
+                        self.coalesced_updates += 1
+                    self._condition.notify_all()
+                    return PublishResult(accepted=True, coalesced=True)
+                if len(self._pending_latest) < self.capacity:
+                    self._pending_latest[event.key] = latest
+                    self._pending_order.append(event.key)
+                    self.pending_keys = len(self._pending_latest)
+                    self.queue_high_watermark = max(
+                        self.queue_high_watermark,
+                        self.pending_keys,
+                    )
+                    if superseded:
+                        self.coalesced_updates += 1
+                    self._condition.notify_all()
+                    return PublishResult(accepted=True, coalesced=superseded)
                 self.publisher_backpressure_waits += 1
-                await self._condition.wait()
-            self._pending_latest[event.key] = event
-            self._pending_order.append(event.key)
-            self.pending_keys = len(self._pending_latest)
-            self.queue_high_watermark = max(self.queue_high_watermark, self.pending_keys)
-            self._condition.notify_all()
-            return PublishResult(accepted=True)
+                self.waiting_publishers += 1
+                self._condition.notify_all()
+                try:
+                    await self._condition.wait()
+                finally:
+                    self.waiting_publishers -= 1
 
     async def next_event(self) -> MarketEvent:
         async with self._condition:
             while not self._pending_latest:
+                if self._closed:
+                    raise EventBusClosed("event bus is closed")
                 await self._condition.wait()
             key = self._pending_order.popleft()
             event = self._pending_latest.pop(key)
             self.pending_keys = len(self._pending_latest)
             self._condition.notify_all()
             return event
+
+    async def close(self) -> None:
+        """Stop admission and wake every backpressured publisher/consumer."""
+
+        async with self._condition:
+            self._closed = True
+            self._condition.notify_all()
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -538,6 +601,8 @@ class CoalescingEventBus:
             "queue_capacity": self.capacity,
             "queue_high_watermark": self.queue_high_watermark,
             "publisher_backpressure_waits": self.publisher_backpressure_waits,
+            "waiting_publishers": self.waiting_publishers,
+            "closed": self._closed,
             "dropped_events": self.dropped_events,
         }
 
@@ -855,6 +920,7 @@ class RealtimeScanner:
             final_error = f"{type(exc).__name__}: {exc}"
         finally:
             self._stop_event.set()
+            await self._bus.close()
             for handler in self.shutdown_handlers:
                 try:
                     await handler()

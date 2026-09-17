@@ -20,7 +20,9 @@ import {
 import type { ConfigureMessage, PoolDescriptor, QuoteRequestMessage } from "./protocol.js";
 import {
   coreRefreshDue,
+  coreRefreshOverdueMs,
   DebouncedStateEmitter,
+  FairMaintenanceCursor,
   PoolSlotProvenance,
   type RunRpcJob,
 } from "./engineRuntime.js";
@@ -154,8 +156,10 @@ interface AttachedPool {
   coreAccountData: Buffer;
   poolSubscriptionId: number;
   tickSubscriptionIds: Map<string, number>;
+  retiredTickSubscriptionIds: Set<number>;
   tickArraysAToB: TickArray[];
   tickArraysBToA: TickArray[];
+  tickAccountData: Map<string, Buffer>;
   tickCacheAtMs: number;
   tickRefresh?: Promise<void>;
   stateEmitter: DebouncedStateEmitter;
@@ -201,6 +205,9 @@ export class OrcaWhirlpoolQuoteEngine {
   private refreshesStarted = 0;
   private refreshesCompleted = 0;
   private refreshesUnchanged = 0;
+  private readonly maintenanceCursor = new FairMaintenanceCursor();
+  private maintenanceDuePoolCount = 0;
+  private maintenanceMaximumOverdueMs = 0;
 
   public constructor(
     private readonly callbacks: OrcaEngineCallbacks,
@@ -240,6 +247,7 @@ export class OrcaWhirlpoolQuoteEngine {
       const subscriptions = [...this.pools.values()].flatMap((pool) => [
         pool.poolSubscriptionId,
         ...pool.tickSubscriptionIds.values(),
+        ...pool.retiredTickSubscriptionIds,
       ]);
       await Promise.all(
         subscriptions
@@ -258,17 +266,28 @@ export class OrcaWhirlpoolQuoteEngine {
   }
 
   public async maintainStalePools(nowMs = performance.now()): Promise<void> {
-    for (const pool of this.pools.values()) {
-      if (pool.provenance.refreshInFlight || !coreRefreshDue(
-        pool.provenance,
-        `orca-whirlpool:${pool.descriptor.pool_id}`,
+    const candidates = [...this.pools.values()];
+    const overdue = candidates.map((candidate) => coreRefreshOverdueMs(
+      candidate.provenance,
+      `orca-whirlpool:${candidate.descriptor.pool_id}`,
+      nowMs,
+      this.coreRefreshAfterMs,
+      this.refreshStaggerWindowMs,
+    ));
+    this.maintenanceDuePoolCount = overdue.filter((value) => value >= 0).length;
+    this.maintenanceMaximumOverdueMs = overdue.reduce((maximum, value) => Math.max(maximum, value), 0);
+    const pool = this.maintenanceCursor.select(
+      candidates,
+      (candidate) => candidate.descriptor.pool_id,
+      (candidate) => !candidate.provenance.refreshInFlight && coreRefreshDue(
+        candidate.provenance,
+        `orca-whirlpool:${candidate.descriptor.pool_id}`,
         nowMs,
         this.coreRefreshAfterMs,
         this.refreshStaggerWindowMs,
-      )) continue;
-      await this.scheduleCoreRefresh(pool);
-      return;
-    }
+      ),
+    );
+    if (pool !== undefined) await this.scheduleCoreRefresh(pool);
   }
 
   public async quote(request: QuoteRequestMessage): Promise<OrcaQuoteResult> {
@@ -324,7 +343,7 @@ export class OrcaWhirlpoolQuoteEngine {
         transfer_fee_output_raw: result.transferFee.deductedFromEstimatedAmountOut.toString(10),
         pool_fee_on_input: true,
         all_trade: result.estimatedAmountIn.eq(input),
-        tick_cache_age_ms: Math.max(0, Date.now() - pool.tickCacheAtMs),
+        tick_cache_age_ms: Math.max(0, performance.now() - pool.tickCacheAtMs),
       };
     } catch (error) {
       void this.ensureTickCache(pool, true).catch(() => undefined);
@@ -359,8 +378,10 @@ export class OrcaWhirlpoolQuoteEngine {
       coreAccountData: Buffer.from(account.value.data),
       poolSubscriptionId: -1,
       tickSubscriptionIds: new Map(),
+      retiredTickSubscriptionIds: new Set(),
       tickArraysAToB: [],
       tickArraysBToA: [],
+      tickAccountData: new Map(),
       tickCacheAtMs: 0,
       stateEmitter: new DebouncedStateEmitter(
         () => this.emitPoolStateNow(pool),
@@ -379,8 +400,7 @@ export class OrcaWhirlpoolQuoteEngine {
 
   private updatePool(pool: AttachedPool, account: AccountInfo<Buffer>, context: Context): void {
     if (context.slot <= pool.provenance.coreStateSlot) return;
-    const data = Orca.ParsableWhirlpool.parse(pool.address, account);
-    if (data === null || Orca.PoolUtil.isInitializedWithAdaptiveFee(data)) return;
+    const data = this.decodePoolAccount(pool, account);
     pool.data = data;
     pool.coreAccountData = Buffer.from(account.data);
     if (!pool.provenance.acceptCore(context.slot)) return;
@@ -394,19 +414,24 @@ export class OrcaWhirlpoolQuoteEngine {
     context: Context,
   ): void {
     const key = address.toBase58();
-    const data = Orca.ParsableTickArray.parse(address, account);
-    if (data === null) return;
-    if (!pool.provenance.acceptDependency(key, context.slot)) return;
+    const previousSlot = pool.provenance.dependencySlot(key);
+    if (previousSlot !== undefined && context.slot <= previousSlot) return;
+    const data = this.decodeTickAccount(address, account);
+    const previousData = pool.tickAccountData.get(key);
+    const changed = previousData === undefined || !previousData.equals(account.data);
+    if (!pool.provenance.acceptDependencyVersion(key, context.slot, changed)) return;
     const replace = (items: TickArray[]): TickArray[] => items.map((item) =>
       item.address.equals(address) ? { ...item, data } : item);
     pool.tickArraysAToB = replace(pool.tickArraysAToB);
     pool.tickArraysBToA = replace(pool.tickArraysBToA);
-    pool.tickCacheAtMs = Date.now();
-    this.requestPoolState(
-      pool,
-      `dependency:${pool.provenance.dependencyGeneration}`,
-      "debounced",
-    );
+    pool.tickAccountData.set(key, Buffer.from(account.data));
+    if (changed) {
+      this.requestPoolState(
+        pool,
+        `dependency:${pool.provenance.dependencyGeneration}`,
+        "debounced",
+      );
+    }
   }
 
   private async ensureTickCache(pool: AttachedPool, force: boolean): Promise<void> {
@@ -414,7 +439,7 @@ export class OrcaWhirlpoolQuoteEngine {
       !force
       && pool.tickArraysAToB.length > 0
       && pool.tickArraysBToA.length > 0
-      && Date.now() - pool.tickCacheAtMs <= this.tickCacheMaxAgeMs
+      && performance.now() - pool.tickCacheAtMs <= this.tickCacheMaxAgeMs
     ) return;
     if (pool.tickRefresh !== undefined) return pool.tickRefresh;
     pool.tickRefresh = this.refreshTicks(pool);
@@ -429,6 +454,7 @@ export class OrcaWhirlpoolQuoteEngine {
     const connection = this.requireConnection();
     const fetcher = this.requireFetcher();
     const hadCache = pool.tickArraysAToB.length > 0 || pool.tickArraysBToA.length > 0;
+    const coreSlotBefore = pool.provenance.coreStateSlot;
     const [aToB, bToA] = await Promise.all([
       Orca.SwapUtils.getTickArrays(
         pool.data.tickCurrentIndex,
@@ -452,42 +478,132 @@ export class OrcaWhirlpoolQuoteEngine {
     const current = new Map(
       [...aToB, ...bToA].map((item) => [item.address.toBase58(), item] as const),
     );
-    for (const [address, subscriptionId] of pool.tickSubscriptionIds) {
-      if (!current.has(address)) {
-        await connection.removeAccountChangeListener(subscriptionId);
-        pool.tickSubscriptionIds.delete(address);
-        pool.provenance.forgetDependency(address);
-      }
+    if (current.size === 0) throw new Error("Orca returned no nearby tick arrays");
+    await this.cleanupRetiredTickSubscriptions(pool, connection);
+    if (pool.retiredTickSubscriptionIds.size > 0
+      && [...current.keys()].some((address) => !pool.tickSubscriptionIds.has(address))) {
+      throw new Error("Orca dependency listener cleanup is pending; refusing a duplicate subscription");
     }
+    const addedSubscriptions: Array<readonly [string, number]> = [];
     for (const [address, item] of current) {
       if (!pool.tickSubscriptionIds.has(address)) {
-        const subscriptionId = connection.onAccountChange(
+        let subscriptionId = -1;
+        subscriptionId = connection.onAccountChange(
           item.address,
-          (updated, context) => this.updateTick(pool, item.address, updated, context),
+          (updated, context) => {
+            if (pool.tickSubscriptionIds.get(address) !== subscriptionId) return;
+            this.updateTick(pool, item.address, updated, context);
+          },
           "processed",
         );
         pool.tickSubscriptionIds.set(address, subscriptionId);
+        addedSubscriptions.push([address, subscriptionId]);
       }
     }
-    const preservePushed = (items: TickArray[]): TickArray[] => items.map((item) => {
-      const address = item.address.toBase58();
-      if (pool.provenance.dependencySlot(address) === undefined) return item;
-      return [...pool.tickArraysAToB, ...pool.tickArraysBToA]
-        .find((existing) => existing.address.equals(item.address)) ?? item;
-    });
-    pool.tickArraysAToB = preservePushed(aToB);
-    pool.tickArraysBToA = preservePushed(bToA);
-    pool.tickCacheAtMs = Date.now();
-    if (hadCache) {
-      pool.provenance.advanceDependencyGeneration();
-      this.requestPoolState(
-        pool,
-        `dependency:${pool.provenance.dependencyGeneration}`,
-        "debounced",
+
+    try {
+      const addresses = [...current.values()].map((item) => item.address);
+      const snapshot = await connection.getMultipleAccountsInfoAndContext(addresses, "processed");
+      if (snapshot.value.length !== addresses.length) {
+        throw new Error("Orca tick snapshot returned an incomplete account vector");
+      }
+      const staged = new Map<string, TickArray["data"]>();
+      const stagedData = new Map<string, Buffer>();
+      for (let index = 0; index < addresses.length; index += 1) {
+        const address = addresses[index]!;
+        const value = snapshot.value[index];
+        if (value === null) throw new Error(`Orca tick account ${address.toBase58()} disappeared`);
+        staged.set(address.toBase58(), this.decodeTickAccount(address, value));
+        stagedData.set(address.toBase58(), Buffer.from(value.data));
+      }
+      if (pool.provenance.coreStateSlot !== coreSlotBefore) {
+        throw new Error("Orca core changed during tick discovery; dependency refresh must retry");
+      }
+      const existing = new Map(
+        [...pool.tickArraysAToB, ...pool.tickArraysBToA]
+          .map((item) => [item.address.toBase58(), item.data] as const),
       );
-    } else {
+      for (const address of current.keys()) {
+        const currentSlot = pool.provenance.dependencySlot(address);
+        if (currentSlot !== undefined && currentSlot >= snapshot.context.slot
+          && !existing.has(address)) {
+          throw new Error(`Orca tick ${address} has provenance without cached data`);
+        }
+      }
+
+      const generationBefore = pool.provenance.dependencyGeneration;
+      for (const [address, subscriptionId] of pool.tickSubscriptionIds) {
+        if (current.has(address)) continue;
+        pool.tickSubscriptionIds.delete(address);
+        pool.retiredTickSubscriptionIds.add(subscriptionId);
+        pool.tickAccountData.delete(address);
+        pool.provenance.removeDependency(address);
+      }
+      const resolved = new Map<string, TickArray["data"]>();
+      for (const address of current.keys()) {
+        const currentSlot = pool.provenance.dependencySlot(address);
+        if (currentSlot !== undefined && currentSlot >= snapshot.context.slot) {
+          resolved.set(address, existing.get(address)!);
+          continue;
+        }
+        const data = stagedData.get(address)!;
+        const previousData = pool.tickAccountData.get(address);
+        const changed = previousData === undefined || !previousData.equals(data);
+        pool.provenance.acceptDependencyVersion(address, snapshot.context.slot, changed);
+        pool.tickAccountData.set(address, data);
+        resolved.set(address, staged.get(address)!);
+      }
+      const withResolvedData = (items: TickArray[]): TickArray[] => items.map((item) => ({
+        ...item,
+        data: resolved.get(item.address.toBase58())!,
+      }));
+      pool.tickArraysAToB = withResolvedData(aToB);
+      pool.tickArraysBToA = withResolvedData(bToA);
+      pool.tickCacheAtMs = performance.now();
       pool.provenance.noteDependencyRefresh();
+      await this.cleanupRetiredTickSubscriptions(pool, connection);
+      if (hadCache && pool.provenance.dependencyGeneration !== generationBefore) {
+        this.requestPoolState(
+          pool,
+          `dependency:${pool.provenance.dependencyGeneration}`,
+          "debounced",
+        );
+      }
+    } catch (error) {
+      await Promise.all(addedSubscriptions.map(async ([address, subscriptionId]) => {
+        if (pool.tickSubscriptionIds.get(address) === subscriptionId) {
+          pool.tickSubscriptionIds.delete(address);
+          pool.retiredTickSubscriptionIds.add(subscriptionId);
+        }
+      }));
+      await this.cleanupRetiredTickSubscriptions(pool, connection);
+      throw error;
     }
+  }
+
+  private async cleanupRetiredTickSubscriptions(pool: AttachedPool, connection: Connection): Promise<void> {
+    await Promise.all([...pool.retiredTickSubscriptionIds].map(async (subscriptionId) => {
+      try {
+        await connection.removeAccountChangeListener(subscriptionId);
+        pool.retiredTickSubscriptionIds.delete(subscriptionId);
+      } catch {
+        // Callback membership guards make retired ids inert; retain for retry.
+      }
+    }));
+  }
+
+  private decodeTickAccount(address: PublicKey, account: AccountInfo<Buffer>): TickArray["data"] {
+    const data = Orca.ParsableTickArray.parse(address, account);
+    if (data === null) throw new Error(`Orca tick account ${address.toBase58()} could not be decoded`);
+    return data;
+  }
+
+  private decodePoolAccount(pool: AttachedPool, account: AccountInfo<Buffer>): WhirlpoolData {
+    const data = Orca.ParsableWhirlpool.parse(pool.address, account);
+    if (data === null || Orca.PoolUtil.isInitializedWithAdaptiveFee(data)) {
+      throw new Error(`Orca pool ${pool.descriptor.pool_id} could not be decoded or became unsupported`);
+    }
+    return data;
   }
 
   private async scheduleCoreRefresh(pool: AttachedPool): Promise<void> {
@@ -520,10 +636,7 @@ export class OrcaWhirlpoolQuoteEngine {
       }
       return;
     }
-    const data = Orca.ParsableWhirlpool.parse(pool.address, account.value);
-    if (data === null || Orca.PoolUtil.isInitializedWithAdaptiveFee(data)) {
-      throw new Error(`Orca pool ${pool.descriptor.pool_id} became unsupported during refresh`);
-    }
+    const data = this.decodePoolAccount(pool, account.value);
     const changed = !pool.coreAccountData.equals(account.value.data);
     pool.data = data;
     pool.coreAccountData = Buffer.from(account.value.data);
@@ -572,7 +685,7 @@ export class OrcaWhirlpoolQuoteEngine {
       fee_rate_millionths: pool.data.feeRate,
       tick_cache_age_ms: pool.tickCacheAtMs === 0
         ? null
-        : Math.max(0, Date.now() - pool.tickCacheAtMs),
+        : Math.max(0, performance.now() - pool.tickCacheAtMs),
       ...pool.provenance.fields(),
     });
   }
@@ -581,11 +694,13 @@ export class OrcaWhirlpoolQuoteEngine {
     let dependencyEmitsCoalesced = 0;
     let externalEmits = 0;
     let refreshInFlight = 0;
+    let retiredSubscriptions = 0;
     for (const pool of this.pools.values()) {
       const emitter = pool.stateEmitter.stats();
       dependencyEmitsCoalesced += emitter.coalesced_total;
       externalEmits += emitter.external_emits_total;
       refreshInFlight += pool.provenance.refreshInFlight ? 1 : 0;
+      retiredSubscriptions += pool.retiredTickSubscriptionIds.size;
     }
     return {
       pool_count: this.pools.size,
@@ -595,6 +710,10 @@ export class OrcaWhirlpoolQuoteEngine {
       refreshes_started_total: this.refreshesStarted,
       refreshes_completed_total: this.refreshesCompleted,
       refreshes_unchanged_total: this.refreshesUnchanged,
+      maintenance_selected_total: this.maintenanceCursor.stats().selected_total,
+      maintenance_due_pool_count: this.maintenanceDuePoolCount,
+      maintenance_maximum_overdue_ms: this.maintenanceMaximumOverdueMs,
+      retired_dependency_subscriptions: retiredSubscriptions,
     };
   }
 

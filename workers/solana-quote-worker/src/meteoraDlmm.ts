@@ -15,7 +15,9 @@ import {
 import type { ConfigureMessage, PoolDescriptor, QuoteRequestMessage } from "./protocol.js";
 import {
   coreRefreshDue,
+  coreRefreshOverdueMs,
   DebouncedStateEmitter,
+  FairMaintenanceCursor,
   PoolSlotProvenance,
   type RunRpcJob,
 } from "./engineRuntime.js";
@@ -79,7 +81,9 @@ interface AttachedPool {
   coreAccountData: Buffer;
   poolSubscriptionId: number;
   binArrays: Map<string, BinArrayAccount>;
+  binAccountData: Map<string, Buffer>;
   binSubscriptionIds: Map<string, number>;
+  retiredBinSubscriptionIds: Set<number>;
   binCacheAtMs: number;
   binRefresh?: Promise<void>;
   stateEmitter: DebouncedStateEmitter;
@@ -134,6 +138,9 @@ export class MeteoraDlmmQuoteEngine {
   private refreshesStarted = 0;
   private refreshesCompleted = 0;
   private refreshesUnchanged = 0;
+  private readonly maintenanceCursor = new FairMaintenanceCursor();
+  private maintenanceDuePoolCount = 0;
+  private maintenanceMaximumOverdueMs = 0;
 
   public constructor(
     private readonly callbacks: MeteoraEngineCallbacks,
@@ -173,6 +180,7 @@ export class MeteoraDlmmQuoteEngine {
       const subscriptions = [...this.pools.values()].flatMap((pool) => [
         pool.poolSubscriptionId,
         ...pool.binSubscriptionIds.values(),
+        ...pool.retiredBinSubscriptionIds,
       ]);
       await Promise.all(
         subscriptions
@@ -190,17 +198,28 @@ export class MeteoraDlmmQuoteEngine {
   }
 
   public async maintainStalePools(nowMs = performance.now()): Promise<void> {
-    for (const pool of this.pools.values()) {
-      if (pool.provenance.refreshInFlight || !coreRefreshDue(
-        pool.provenance,
-        `meteora-dlmm:${pool.descriptor.pool_id}`,
+    const candidates = [...this.pools.values()];
+    const overdue = candidates.map((candidate) => coreRefreshOverdueMs(
+      candidate.provenance,
+      `meteora-dlmm:${candidate.descriptor.pool_id}`,
+      nowMs,
+      this.coreRefreshAfterMs,
+      this.refreshStaggerWindowMs,
+    ));
+    this.maintenanceDuePoolCount = overdue.filter((value) => value >= 0).length;
+    this.maintenanceMaximumOverdueMs = overdue.reduce((maximum, value) => Math.max(maximum, value), 0);
+    const pool = this.maintenanceCursor.select(
+      candidates,
+      (candidate) => candidate.descriptor.pool_id,
+      (candidate) => !candidate.provenance.refreshInFlight && coreRefreshDue(
+        candidate.provenance,
+        `meteora-dlmm:${candidate.descriptor.pool_id}`,
         nowMs,
         this.coreRefreshAfterMs,
         this.refreshStaggerWindowMs,
-      )) continue;
-      await this.scheduleCoreRefresh(pool);
-      return;
-    }
+      ),
+    );
+    if (pool !== undefined) await this.scheduleCoreRefresh(pool);
   }
 
   public async quote(request: QuoteRequestMessage): Promise<MeteoraQuoteResult> {
@@ -249,7 +268,7 @@ export class MeteoraDlmmQuoteEngine {
         pool_fee_on_input: result.feeOnInput,
         price_impact_pct: result.priceImpact.toString(),
         all_trade: result.consumedInAmount.eq(input),
-        bin_cache_age_ms: Math.max(0, Date.now() - pool.binCacheAtMs),
+        bin_cache_age_ms: Math.max(0, performance.now() - pool.binCacheAtMs),
       };
     } catch (error) {
       void this.ensureBinCache(pool, true).catch(() => undefined);
@@ -278,7 +297,9 @@ export class MeteoraDlmmQuoteEngine {
       coreAccountData: Buffer.from(account.value.data),
       poolSubscriptionId: -1,
       binArrays: new Map(),
+      binAccountData: new Map(),
       binSubscriptionIds: new Map(),
+      retiredBinSubscriptionIds: new Set(),
       binCacheAtMs: 0,
       stateEmitter: new DebouncedStateEmitter(
         () => this.emitPoolStateNow(pool),
@@ -297,11 +318,8 @@ export class MeteoraDlmmQuoteEngine {
 
   private updatePair(pool: AttachedPool, account: AccountInfo<Buffer>, context: Context): void {
     if (context.slot <= pool.provenance.coreStateSlot) return;
-    pool.dlmm.lbPair = MeteoraSdk.decodeAccount(
-      pool.dlmm.program,
-      "lbPair",
-      account.data,
-    ) as DlmmClient["lbPair"];
+    const pair = this.decodePairAccount(pool, account);
+    pool.dlmm.lbPair = pair;
     pool.coreAccountData = Buffer.from(account.data);
     if (!pool.provenance.acceptCore(context.slot)) return;
     this.requestPoolState(pool, `core:${context.slot}`, "immediate");
@@ -314,26 +332,28 @@ export class MeteoraDlmmQuoteEngine {
     context: Context,
   ): void {
     const key = publicKey.toBase58();
-    const decoded = MeteoraSdk.decodeAccount(
-      pool.dlmm.program,
-      "binArray",
-      account.data,
-    ) as BinArrayAccount["account"];
-    if (!pool.provenance.acceptDependency(key, context.slot)) return;
+    const previousSlot = pool.provenance.dependencySlot(key);
+    if (previousSlot !== undefined && context.slot <= previousSlot) return;
+    const decoded = this.decodeBinAccount(pool, account);
+    const previousData = pool.binAccountData.get(key);
+    const changed = previousData === undefined || !previousData.equals(account.data);
+    if (!pool.provenance.acceptDependencyVersion(key, context.slot, changed)) return;
     pool.binArrays.set(publicKey.toBase58(), {
       publicKey,
       account: decoded,
     });
-    pool.binCacheAtMs = Date.now();
-    this.requestPoolState(
-      pool,
-      `dependency:${pool.provenance.dependencyGeneration}`,
-      "debounced",
-    );
+    pool.binAccountData.set(key, Buffer.from(account.data));
+    if (changed) {
+      this.requestPoolState(
+        pool,
+        `dependency:${pool.provenance.dependencyGeneration}`,
+        "debounced",
+      );
+    }
   }
 
   private async ensureBinCache(pool: AttachedPool, force: boolean): Promise<void> {
-    if (!force && pool.binArrays.size > 0 && Date.now() - pool.binCacheAtMs <= this.binCacheMaxAgeMs) {
+    if (!force && pool.binArrays.size > 0 && performance.now() - pool.binCacheAtMs <= this.binCacheMaxAgeMs) {
       return;
     }
     if (pool.binRefresh !== undefined) return pool.binRefresh;
@@ -348,52 +368,135 @@ export class MeteoraDlmmQuoteEngine {
   private async refreshBins(pool: AttachedPool): Promise<void> {
     const connection = this.requireConnection();
     const hadCache = pool.binArrays.size > 0;
+    const coreSlotBefore = pool.provenance.coreStateSlot;
     const [forY, forX] = await Promise.all([
       pool.dlmm.getBinArrayForSwap(true, 4),
       pool.dlmm.getBinArrayForSwap(false, 4),
     ]);
-    const current = new Map<string, BinArrayAccount>();
-    for (const item of [...forY, ...forX]) current.set(item.publicKey.toBase58(), item);
-    if (current.size === 0) throw new Error("Meteora returned no nearby bin arrays");
+    const discovered = new Map<string, PublicKey>();
+    for (const item of [...forY, ...forX]) discovered.set(item.publicKey.toBase58(), item.publicKey);
+    if (discovered.size === 0) throw new Error("Meteora returned no nearby bin arrays");
 
-    for (const [address, subscriptionId] of pool.binSubscriptionIds) {
-      if (!current.has(address)) {
-        await connection.removeAccountChangeListener(subscriptionId);
-        pool.binSubscriptionIds.delete(address);
-        pool.provenance.forgetDependency(address);
-      }
+    await this.cleanupRetiredBinSubscriptions(pool, connection);
+    if (pool.retiredBinSubscriptionIds.size > 0
+      && [...discovered.keys()].some((address) => !pool.binSubscriptionIds.has(address))) {
+      throw new Error("Meteora dependency listener cleanup is pending; refusing a duplicate subscription");
     }
-    for (const [address, item] of current) {
+    const addedSubscriptions: Array<readonly [string, number]> = [];
+    for (const [address, publicKey] of discovered) {
       if (!pool.binSubscriptionIds.has(address)) {
-        const subscriptionId = connection.onAccountChange(
-          item.publicKey,
-          (updated, context) => this.updateBin(pool, item.publicKey, updated, context),
+        let subscriptionId = -1;
+        subscriptionId = connection.onAccountChange(
+          publicKey,
+          (updated, context) => {
+            if (pool.binSubscriptionIds.get(address) !== subscriptionId) return;
+            this.updateBin(pool, publicKey, updated, context);
+          },
           "processed",
         );
         pool.binSubscriptionIds.set(address, subscriptionId);
+        addedSubscriptions.push([address, subscriptionId]);
       }
     }
-    // SDK refreshes do not expose an account context slot. Preserve any
-    // subscribed value with explicit WS provenance instead of overwriting it
-    // with a contextless (and possibly older) RPC value.
-    for (const [address, item] of current) {
-      if (pool.provenance.dependencySlot(address) !== undefined) {
-        const pushed = pool.binArrays.get(address);
-        if (pushed !== undefined) current.set(address, pushed);
+
+    try {
+      const addresses = [...discovered.values()];
+      const snapshot = await connection.getMultipleAccountsInfoAndContext(addresses, "processed");
+      if (snapshot.value.length !== addresses.length) {
+        throw new Error("Meteora bin snapshot returned an incomplete account vector");
       }
-    }
-    pool.binArrays = current;
-    pool.binCacheAtMs = Date.now();
-    if (hadCache) {
-      pool.provenance.advanceDependencyGeneration();
-      this.requestPoolState(
-        pool,
-        `dependency:${pool.provenance.dependencyGeneration}`,
-        "debounced",
-      );
-    } else {
+      const staged = new Map<string, BinArrayAccount>();
+      const stagedData = new Map<string, Buffer>();
+      for (let index = 0; index < addresses.length; index += 1) {
+        const publicKey = addresses[index]!;
+        const value = snapshot.value[index];
+        if (value === null) throw new Error(`Meteora bin account ${publicKey.toBase58()} disappeared`);
+        staged.set(publicKey.toBase58(), {
+          publicKey,
+          account: this.decodeBinAccount(pool, value),
+        });
+        stagedData.set(publicKey.toBase58(), Buffer.from(value.data));
+      }
+      if (pool.provenance.coreStateSlot !== coreSlotBefore) {
+        throw new Error("Meteora core changed during bin discovery; dependency refresh must retry");
+      }
+      for (const address of discovered.keys()) {
+        const currentSlot = pool.provenance.dependencySlot(address);
+        if (currentSlot !== undefined && currentSlot >= snapshot.context.slot
+          && !pool.binArrays.has(address)) {
+          throw new Error(`Meteora bin ${address} has provenance without cached data`);
+        }
+      }
+
+      const generationBefore = pool.provenance.dependencyGeneration;
+      const next = new Map(pool.binArrays);
+      for (const [address, subscriptionId] of pool.binSubscriptionIds) {
+        if (discovered.has(address)) continue;
+        pool.binSubscriptionIds.delete(address);
+        pool.retiredBinSubscriptionIds.add(subscriptionId);
+        next.delete(address);
+        pool.binAccountData.delete(address);
+        pool.provenance.removeDependency(address);
+      }
+      for (const address of discovered.keys()) {
+        const currentSlot = pool.provenance.dependencySlot(address);
+        if (currentSlot !== undefined && currentSlot >= snapshot.context.slot) continue;
+        const data = stagedData.get(address)!;
+        const previousData = pool.binAccountData.get(address);
+        const changed = previousData === undefined || !previousData.equals(data);
+        pool.provenance.acceptDependencyVersion(address, snapshot.context.slot, changed);
+        next.set(address, staged.get(address)!);
+        pool.binAccountData.set(address, data);
+      }
+      pool.binArrays = next;
+      pool.binCacheAtMs = performance.now();
       pool.provenance.noteDependencyRefresh();
+      await this.cleanupRetiredBinSubscriptions(pool, connection);
+      if (hadCache && pool.provenance.dependencyGeneration !== generationBefore) {
+        this.requestPoolState(
+          pool,
+          `dependency:${pool.provenance.dependencyGeneration}`,
+          "debounced",
+        );
+      }
+    } catch (error) {
+      await Promise.all(addedSubscriptions.map(async ([address, subscriptionId]) => {
+        if (pool.binSubscriptionIds.get(address) === subscriptionId) {
+          pool.binSubscriptionIds.delete(address);
+          pool.retiredBinSubscriptionIds.add(subscriptionId);
+        }
+      }));
+      await this.cleanupRetiredBinSubscriptions(pool, connection);
+      throw error;
     }
+  }
+
+  private async cleanupRetiredBinSubscriptions(pool: AttachedPool, connection: Connection): Promise<void> {
+    await Promise.all([...pool.retiredBinSubscriptionIds].map(async (subscriptionId) => {
+      try {
+        await connection.removeAccountChangeListener(subscriptionId);
+        pool.retiredBinSubscriptionIds.delete(subscriptionId);
+      } catch {
+        // Keep the id bounded by the discovered account universe and retry on
+        // the next refresh or engine close. Its callback is already inactive.
+      }
+    }));
+  }
+
+  private decodeBinAccount(pool: AttachedPool, account: AccountInfo<Buffer>): BinArrayAccount["account"] {
+    return MeteoraSdk.decodeAccount(
+      pool.dlmm.program,
+      "binArray",
+      account.data,
+    ) as BinArrayAccount["account"];
+  }
+
+  private decodePairAccount(pool: AttachedPool, account: AccountInfo<Buffer>): DlmmClient["lbPair"] {
+    return MeteoraSdk.decodeAccount(
+      pool.dlmm.program,
+      "lbPair",
+      account.data,
+    ) as DlmmClient["lbPair"];
   }
 
   private async scheduleCoreRefresh(pool: AttachedPool): Promise<void> {
@@ -427,11 +530,7 @@ export class MeteoraDlmmQuoteEngine {
       return;
     }
     const changed = !pool.coreAccountData.equals(account.value.data);
-    pool.dlmm.lbPair = MeteoraSdk.decodeAccount(
-      pool.dlmm.program,
-      "lbPair",
-      account.value.data,
-    ) as DlmmClient["lbPair"];
+    pool.dlmm.lbPair = this.decodePairAccount(pool, account.value);
     pool.coreAccountData = Buffer.from(account.value.data);
     if (account.context.slot > pool.provenance.coreStateSlot) {
       pool.provenance.acceptCore(account.context.slot);
@@ -472,7 +571,9 @@ export class MeteoraDlmmQuoteEngine {
       token_a_decimals: pool.dlmm.tokenX.mint.decimals,
       token_b_decimals: pool.dlmm.tokenY.mint.decimals,
       bin_step: pool.dlmm.lbPair.binStep,
-      bin_cache_age_ms: pool.binCacheAtMs === 0 ? null : Math.max(0, Date.now() - pool.binCacheAtMs),
+      bin_cache_age_ms: pool.binCacheAtMs === 0
+        ? null
+        : Math.max(0, performance.now() - pool.binCacheAtMs),
       ...pool.provenance.fields(),
     });
   }
@@ -481,11 +582,13 @@ export class MeteoraDlmmQuoteEngine {
     let dependencyEmitsCoalesced = 0;
     let externalEmits = 0;
     let refreshInFlight = 0;
+    let retiredSubscriptions = 0;
     for (const pool of this.pools.values()) {
       const emitter = pool.stateEmitter.stats();
       dependencyEmitsCoalesced += emitter.coalesced_total;
       externalEmits += emitter.external_emits_total;
       refreshInFlight += pool.provenance.refreshInFlight ? 1 : 0;
+      retiredSubscriptions += pool.retiredBinSubscriptionIds.size;
     }
     return {
       pool_count: this.pools.size,
@@ -495,6 +598,10 @@ export class MeteoraDlmmQuoteEngine {
       refreshes_started_total: this.refreshesStarted,
       refreshes_completed_total: this.refreshesCompleted,
       refreshes_unchanged_total: this.refreshesUnchanged,
+      maintenance_selected_total: this.maintenanceCursor.stats().selected_total,
+      maintenance_due_pool_count: this.maintenanceDuePoolCount,
+      maintenance_maximum_overdue_ms: this.maintenanceMaximumOverdueMs,
+      retired_dependency_subscriptions: retiredSubscriptions,
     };
   }
 

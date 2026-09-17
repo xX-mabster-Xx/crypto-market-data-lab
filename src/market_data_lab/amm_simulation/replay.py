@@ -437,6 +437,10 @@ def _decode_snapshot(payload: dict[str, object]):
                     protocol_fee_rate=raw_from_json(item["protocol_fee_rate"]),
                     fund_fee_rate=raw_from_json(item["fund_fee_rate"]),
                     fee_on=raw_from_json(item["fee_on"]),
+                    core_state_slot=int(item["core_state_slot"]) if item.get("core_state_slot") is not None else 0,
+                    dependency_slot_min=int(item["dependency_slot_min"]) if item.get("dependency_slot_min") is not None else None,
+                    dependency_slot_max=int(item["dependency_slot_max"]) if item.get("dependency_slot_max") is not None else None,
+                    dependency_generation=int(item["dependency_generation"]) if item.get("dependency_generation") is not None else 0,
                 ),
             )
         else:

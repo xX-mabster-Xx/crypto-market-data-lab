@@ -63,7 +63,7 @@ class AmmSimulationWorkerContractsTest(unittest.TestCase):
             ],
             "context_slot": 50,
             "chain_consistency": "validated_multi_account_snapshot",
-            "sdk_versions": [["@raydium-io/raydium-sdk-v2", "latest"]],
+            "sdk_versions": [["@raydium-io/raydium-sdk-v2", "0.2.63-alpha"]],
         }
         from market_data_lab.amm_simulation.replay import _decode_snapshot
 
@@ -147,7 +147,7 @@ def _worker_bundle() -> dict[str, object]:
         ],
         "context_slot": 50,
         "chain_consistency": "validated_multi_account_snapshot",
-        "sdk_versions": [["@raydium-io/raydium-sdk-v2", "latest"]],
+        "sdk_versions": [["@raydium-io/raydium-sdk-v2", "0.2.63-alpha"]],
     }
 
 
