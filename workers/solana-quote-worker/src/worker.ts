@@ -11,6 +11,7 @@ import {
   safeError,
   setProtocolOutputFatalHandler,
   type ConfigureMessage,
+  type WorkerStatsMessage,
 } from "./protocol.js";
 import { RaydiumClmmQuoteEngine } from "./raydiumClmm.js";
 import { MeteoraDlmmQuoteEngine } from "./meteoraDlmm.js";
@@ -70,7 +71,131 @@ const sourceEpoch = workerGeneration;
 let snapshotTtlNs = DEFAULT_SNAPSHOT_TTL_NS;
 const simulationRegistryCounters = { hits: 0, misses: 0, evictions: 0, byte_evictions: 0 };
 
+const DEFAULT_WORKER_STATS_REFRESH_INTERVAL_MS = 10_000;
+const WORKER_STATS_COALESCE_KEY = "worker_stats";
+const DEFAULT_STATS_WARNING_INTERVAL_MS = 30_000;
+let workerStatsRefreshIntervalMs = DEFAULT_WORKER_STATS_REFRESH_INTERVAL_MS;
+let workerStatsTimer: ReturnType<typeof setTimeout> | null = null;
+let workerStatsFailed = false;
+let workerStatsBootAtNs: bigint = 0n;
+const warningThrottles = new Map<string, number>();
+
 function monotonicNs(): bigint { return process.hrtime.bigint(); }
+
+/** Collect per-protocol pool stats from all configured engines. */
+function collectPoolStats(): Record<string, {
+  pool_count: number;
+  refresh_inflight: number;
+  coalesced_core_updates_total: number;
+  external_pool_state_emits_total: number;
+}> {
+  const engines: Array<[string, SnapshotRefreshEngine | null]> = [
+    ["raydium_clmm", raydiumEngine],
+    ["raydium_cpmm", raydiumStandardEngine],
+    ["meteora_dlmm", meteoraEngine],
+    ["orca_whirlpool", orcaEngine],
+  ];
+  const pools: Record<string, {
+    pool_count: number;
+    refresh_inflight: number;
+    coalesced_core_updates_total: number;
+    external_pool_state_emits_total: number;
+  }> = {};
+  for (const [protocol, engine] of engines) {
+    if (engine === null) continue;
+    const stats = engine.runtimeStats();
+    pools[protocol] = {
+      pool_count: stats.pool_count ?? 0,
+      refresh_inflight: stats.refresh_inflight ?? 0,
+      coalesced_core_updates_total: stats.coalesced_core_updates_total ?? 0,
+      external_pool_state_emits_total: stats.external_pool_state_emits_total ?? 0,
+    };
+  }
+  return pools;
+}
+
+/** Build a WorkerStatsMessage from live process, output, and RPC metrics. */
+function collectWorkerStats(): WorkerStatsMessage {
+  const memory = process.memoryUsage();
+  const uptimeSeconds = Number(BigInt.asIntN(53, monotonicNs() - workerStatsBootAtNs)) / 1e9;
+  const outputMetrics = protocolOutputMetrics();
+  const rpc = rpcSchedulerMetrics();
+  return {
+    type: "worker_stats",
+    boot_id: bootId,
+    source_epoch: sourceEpoch,
+    memory: {
+      rss_bytes: memory.rss,
+      heap_total_bytes: memory.heapTotal,
+      heap_used_bytes: memory.heapUsed,
+      external_bytes: memory.external,
+      array_buffers_bytes: memory.arrayBuffers,
+      uptime_seconds: uptimeSeconds,
+    },
+    stdout: {
+      blocked: outputMetrics.stdout_blocked,
+      lossless_queue_size: outputMetrics.stdout_lossless_queue_size,
+      state_pending_keys: outputMetrics.stdout_state_pending_keys,
+      state_coalesced_total: outputMetrics.stdout_state_coalesced_total,
+    },
+    rpc: {
+      queue_total: rpc.rpc_queue_total,
+      queue_interactive: rpc.rpc_queue_interactive,
+      queue_bootstrap: rpc.rpc_queue_bootstrap,
+      queue_refresh: rpc.rpc_queue_refresh,
+      active: rpc.rpc_active,
+      queue_high_watermark: rpc.rpc_queue_high_watermark,
+    },
+    pools: collectPoolStats(),
+    sampled_at_iso: new Date().toISOString(),
+  };
+}
+
+/** Emit worker_stats via the backpressure-aware state channel. */
+function emitWorkerStats(): void {
+  if (configured === false) return;
+  const stats = collectWorkerStats();
+  emitState(WORKER_STATS_COALESCE_KEY, stats as unknown as Record<string, unknown>);
+  checkQueueWarnings(stats);
+}
+
+/** Rate-limited stderr warnings for queue thresholds. */
+function checkQueueWarnings(stats: WorkerStatsMessage): void {
+  const now = Date.now();
+  function shouldWarn(key: string): boolean {
+    const last = warningThrottles.get(key) ?? 0;
+    if (now - last >= DEFAULT_STATS_WARNING_INTERVAL_MS) {
+      warningThrottles.set(key, now);
+      return true;
+    }
+    return false;
+  }
+  const outputMetrics = protocolOutputMetrics();
+  const rpc = rpcSchedulerMetrics();
+  if (stats.stdout.blocked && shouldWarn("stdout_blocked")) {
+    process.stderr.write(
+      `[worker-warning] stdout continuously blocked; lossless_queue_size=${outputMetrics.stdout_lossless_queue_size}\n`,
+    );
+  }
+  if (outputMetrics.stdout_lossless_queue_size > 0
+    && outputMetrics.stdout_lossless_queue_capacity > 0
+    && outputMetrics.stdout_lossless_queue_size / outputMetrics.stdout_lossless_queue_capacity > 0.75
+    && shouldWarn("stdout_queue_high")) {
+    process.stderr.write(
+      `[worker-warning] stdout lossless queue >75% capacity: `
+      + `${outputMetrics.stdout_lossless_queue_size}/${outputMetrics.stdout_lossless_queue_capacity}\n`,
+    );
+  }
+  if (rpc.rpc_queue_total > 0
+    && rpc.rpc_queue_capacity > 0
+    && rpc.rpc_queue_total / rpc.rpc_queue_capacity > 0.75
+    && shouldWarn("rpc_queue_high")) {
+    process.stderr.write(
+      `[worker-warning] RPC queue >75% capacity: `
+      + `${rpc.rpc_queue_total}/${rpc.rpc_queue_capacity}\n`,
+    );
+  }
+}
 
 function evictExpiredSnapshots(now = monotonicNs()): void {
   for (const [token, entry] of simulationSnapshots) {
@@ -463,12 +588,27 @@ function scheduleStateSnapshotRefresh(): void {
   }, maintenanceScanIntervalMs);
 }
 
+function scheduleWorkerStatsTimer(): void {
+  if (closing || workerStatsFailed) return;
+  if (workerStatsTimer !== null) clearTimeout(workerStatsTimer);
+  workerStatsTimer = setTimeout(() => {
+    workerStatsTimer = null;
+    if (closing || !configured) return;
+    emitWorkerStats();
+    scheduleWorkerStatsTimer();
+  }, workerStatsRefreshIntervalMs);
+}
+
 async function shutdown(exitCode = 0): Promise<void> {
   if (closing) return;
   closing = true;
   if (stateSnapshotRefreshTimer !== null) {
     clearTimeout(stateSnapshotRefreshTimer);
     stateSnapshotRefreshTimer = null;
+  }
+  if (workerStatsTimer !== null) {
+    clearTimeout(workerStatsTimer);
+    workerStatsTimer = null;
   }
   if (stateSnapshotRefreshTask !== null) {
     await stateSnapshotRefreshTask.catch(() => undefined);
@@ -506,6 +646,9 @@ async function configure(message: ConfigureMessage): Promise<void> {
   maintenanceScanIntervalMs = message.maintenance_scan_interval_ms
     ?? DEFAULT_MAINTENANCE_SCAN_INTERVAL_MS;
   snapshotTtlNs = BigInt(message.simulation_snapshot_ttl_ms ?? 30_000) * 1_000_000n;
+  workerStatsRefreshIntervalMs = message.worker_stats_refresh_interval_ms
+    ?? DEFAULT_WORKER_STATS_REFRESH_INTERVAL_MS;
+  workerStatsBootAtNs = monotonicNs();
   configureRpcPacer(
     message.rpc_http_min_request_interval_ms,
     message.rpc_max_pending_jobs,
@@ -587,6 +730,7 @@ async function configure(message: ConfigureMessage): Promise<void> {
     rpc_max_pending_jobs: rpcSchedulerMetrics().rpc_queue_capacity,
     output_metrics: protocolOutputMetrics(),
     rpc_metrics: rpcSchedulerMetrics(),
+    worker_stats_refresh_interval_ms: workerStatsRefreshIntervalMs,
     wallet_or_private_key_used: false,
     transactions_submitted: false,
     simulation_capabilities: {
@@ -600,6 +744,7 @@ async function configure(message: ConfigureMessage): Promise<void> {
     canonical_codec: "sha256_sorted_keys_decimal_strings_v1",
   });
   scheduleStateSnapshotRefresh();
+  scheduleWorkerStatsTimer();
 }
 
 async function handleQuote(message: Extract<ReturnType<typeof parseWorkerInput>, { type: "quote_request" }>): Promise<void> {
@@ -636,8 +781,28 @@ async function handleQuote(message: Extract<ReturnType<typeof parseWorkerInput>,
 
 async function handleSimulationMessage(message: Extract<
   ReturnType<typeof parseWorkerInput>,
-  { type: "simulate_path_request" | "snapshot_request" | "export_simulation_evidence" | "cancel_simulation" }
+  { type: "simulate_path_request" | "snapshot_request" | "export_simulation_evidence" | "cancel_simulation" | "worker_stats_request" }
 >): Promise<void> {
+  if (message.type === "worker_stats_request") {
+    if (!configured) {
+      emit({
+        type: "worker_stats_result",
+        request_id: message.request_id,
+        status: "unsupported",
+        reason: "worker is not configured",
+      });
+      return;
+    }
+    emitWorkerStats();
+    const stats = collectWorkerStats();
+    emit({
+      type: "worker_stats_result",
+      request_id: message.request_id,
+      status: "ok",
+      stats,
+    });
+    return;
+  }
   if (!configured) throw new Error("worker must be configured before simulation requests");
   if (message.type === "snapshot_request") {
     if (message.required_consistency !== "validated_multi_account_snapshot") {
@@ -930,6 +1095,7 @@ export async function runWorker(): Promise<void> {
         || message.type === "snapshot_request"
         || message.type === "export_simulation_evidence"
         || message.type === "cancel_simulation"
+        || message.type === "worker_stats_request"
       ) {
         const task = handleSimulationMessage(message);
         inFlightQuotes.add(task);

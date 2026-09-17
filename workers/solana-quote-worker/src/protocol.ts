@@ -36,6 +36,7 @@ export interface ConfigureMessage {
   rpc_http_min_request_interval_ms?: number;
   rpc_max_pending_jobs?: number;
   simulation_snapshot_ttl_ms?: number;
+  worker_stats_refresh_interval_ms?: number;
 }
 
 export interface QuoteRequestMessage {
@@ -102,6 +103,68 @@ export interface CancelSimulationMessage {
   request_id: string;
 }
 
+/** Optional on-demand request for a fresh worker_stats snapshot. */
+export interface WorkerStatsRequestMessage {
+  type: "worker_stats_request";
+  request_id: string;
+}
+
+export interface WorkerStatsResultMessage {
+  type: "worker_stats_result";
+  request_id: string;
+  status: "ok" | "unsupported";
+  reason?: string;
+  stats?: WorkerStatsMessage;
+}
+
+/** Per-pool runtime metrics aggregated across configured engines. */
+export interface PoolStatsByProtocol {
+  /** Total configured pools for this protocol. */
+  readonly pool_count: number;
+  /** Number of pools with an in-flight refresh right now. */
+  readonly refresh_inflight: number;
+  /** Coalesced dependency/state updates that never reached the wire. */
+  readonly coalesced_core_updates_total: number;
+  /** External pool_state emissions published to the supervisor. */
+  readonly external_pool_state_emits_total: number;
+}
+
+/** Memory gauge sampled from `process.memoryUsage()`, units: bytes. */
+export interface WorkerMemoryStats {
+  readonly rss_bytes: number;
+  readonly heap_total_bytes: number;
+  readonly heap_used_bytes: number;
+  readonly external_bytes: number;
+  readonly array_buffers_bytes: number;
+  /** Worker uptime in seconds (monotonic since process start). */
+  readonly uptime_seconds: number;
+}
+
+/** Snapshot of worker-level observability counters. */
+export interface WorkerStatsMessage {
+  readonly type: "worker_stats";
+  readonly boot_id: string;
+  readonly source_epoch: number;
+  readonly memory: WorkerMemoryStats;
+  readonly stdout: {
+    readonly blocked: boolean;
+    readonly lossless_queue_size: number;
+    readonly state_pending_keys: number;
+    readonly state_coalesced_total: number;
+  };
+  readonly rpc: {
+    readonly queue_total: number;
+    readonly queue_interactive: number;
+    readonly queue_bootstrap: number;
+    readonly queue_refresh: number;
+    readonly active: number;
+    readonly queue_high_watermark: number;
+  };
+  readonly pools: Record<string, PoolStatsByProtocol>;
+  /** Wall clock ISO-8601 timestamp at which the stats were sampled. */
+  readonly sampled_at_iso: string;
+}
+
 export type WorkerInput =
   | ConfigureMessage
   | QuoteRequestMessage
@@ -109,6 +172,7 @@ export type WorkerInput =
   | SnapshotRequestMessage
   | ExportSimulationEvidenceMessage
   | CancelSimulationMessage
+  | WorkerStatsRequestMessage
   | ShutdownMessage;
 
 type JsonObject = Record<string, unknown>;
@@ -298,6 +362,10 @@ export function parseWorkerInput(value: unknown): WorkerInput {
     if (simulationSnapshotTtlMs !== undefined && simulationSnapshotTtlMs === 0) {
       throw new Error("simulation_snapshot_ttl_ms must be positive when supplied");
     }
+    const workerStatsRefreshIntervalMs = positiveIntegerField(payload, "worker_stats_refresh_interval_ms");
+    if (workerStatsRefreshIntervalMs !== undefined && workerStatsRefreshIntervalMs === 0) {
+      throw new Error("worker_stats_refresh_interval_ms must be positive when supplied");
+    }
     const raydiumPools = poolDescriptors(payload.raydium_clmm_pools ?? [], "raydium_clmm_pools");
     const raydiumStandardPools = raydiumStandardPoolDescriptors(payload.raydium_standard_pools ?? []);
     const meteoraPools = poolDescriptors(payload.meteora_dlmm_pools ?? [], "meteora_dlmm_pools");
@@ -339,6 +407,9 @@ export function parseWorkerInput(value: unknown): WorkerInput {
       ...(simulationSnapshotTtlMs === undefined
         ? {}
         : { simulation_snapshot_ttl_ms: simulationSnapshotTtlMs }),
+      ...(workerStatsRefreshIntervalMs === undefined
+        ? {}
+        : { worker_stats_refresh_interval_ms: workerStatsRefreshIntervalMs }),
     };
   }
   if (type === "quote_request") {
@@ -430,6 +501,9 @@ export function parseWorkerInput(value: unknown): WorkerInput {
     };
   }
   if (type === "cancel_simulation") {
+    return { type, request_id: stringField(payload, "request_id") };
+  }
+  if (type === "worker_stats_request") {
     return { type, request_id: stringField(payload, "request_id") };
   }
   throw new Error(`unsupported worker message type ${JSON.stringify(type)}`);

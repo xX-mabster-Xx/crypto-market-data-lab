@@ -372,6 +372,7 @@ class RaydiumLocalQuoteWorker:
         pool_state_emit_min_interval_ms: int = 100,
         rpc_http_min_request_interval_ms: int = 200,
         event_capacity: int = 2_048,
+        worker_stats_refresh_interval_ms: int = 10_000,
     ) -> None:
         all_pools = (*pools, *raydium_standard_pools, *meteora_pools, *orca_pools)
         if not all_pools or len({pool.pool_id for pool in all_pools}) != len(all_pools):
@@ -413,6 +414,7 @@ class RaydiumLocalQuoteWorker:
         self.pool_state_emit_min_interval_ms = pool_state_emit_min_interval_ms
         self.rpc_http_min_request_interval_ms = rpc_http_min_request_interval_ms
         self.event_capacity = event_capacity
+        self.worker_stats_refresh_interval_ms = worker_stats_refresh_interval_ms
         self._process: asyncio.subprocess.Process | None = None
         self._events: asyncio.Queue[dict[str, Any] | BaseException] = asyncio.Queue(
             maxsize=event_capacity,
@@ -427,11 +429,17 @@ class RaydiumLocalQuoteWorker:
         self._late_quote_results_dropped = 0
         self._late_quote_errors_dropped = 0
         self._late_simulation_results_dropped = 0
+        self._latest_worker_stats: dict[str, Any] | None = None
         self._closed = False
 
     @property
     def running(self) -> bool:
         return self._process is not None and self._process.returncode is None and not self._closed
+
+    @property
+    def latest_worker_stats(self) -> dict[str, Any] | None:
+        """Latest validated worker_stats dict, or None if no stats received yet."""
+        return self._latest_worker_stats
 
     def safe_descriptor(self) -> dict[str, object]:
         return {
@@ -456,6 +464,7 @@ class RaydiumLocalQuoteWorker:
             "refresh_stagger_window_ms": self.refresh_stagger_window_ms,
             "pool_state_emit_min_interval_ms": self.pool_state_emit_min_interval_ms,
             "rpc_http_min_request_interval_ms": self.rpc_http_min_request_interval_ms,
+            "worker_stats_refresh_interval_ms": self.worker_stats_refresh_interval_ms,
             "late_quote_results_dropped": self._late_quote_results_dropped,
             "late_quote_errors_dropped": self._late_quote_errors_dropped,
             "late_simulation_results_dropped": self._late_simulation_results_dropped,
@@ -514,6 +523,7 @@ class RaydiumLocalQuoteWorker:
                 "refresh_stagger_window_ms": self.refresh_stagger_window_ms,
                 "pool_state_emit_min_interval_ms": self.pool_state_emit_min_interval_ms,
                 "rpc_http_min_request_interval_ms": self.rpc_http_min_request_interval_ms,
+                "worker_stats_refresh_interval_ms": self.worker_stats_refresh_interval_ms,
             },
         )
         try:
@@ -664,6 +674,27 @@ class RaydiumLocalQuoteWorker:
         finally:
             self._pending_cancellations.pop(request_id, None)
 
+    async def request_worker_stats(
+        self, *, request_id: str, timeout_seconds: float = 5.0
+    ) -> dict[str, Any]:
+        """Send a worker_stats_request and await the result."""
+        if not self.running:
+            raise RuntimeError("quote worker is not running")
+        if not request_id or request_id in self._pending_simulations:
+            raise ValueError("request_id must be non-empty and unique while pending")
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending_simulations[request_id] = future
+        try:
+            await self._send(
+                {
+                    "type": "worker_stats_request",
+                    "request_id": request_id,
+                },
+            )
+            return await asyncio.wait_for(future, timeout=timeout_seconds)
+        finally:
+            self._pending_simulations.pop(request_id, None)
+
     async def export_evidence(
         self,
         *,
@@ -731,6 +762,7 @@ class RaydiumLocalQuoteWorker:
             if not future.done():
                 future.set_exception(failure)
         self._pending_cancellations.clear()
+        self._latest_worker_stats = None
 
     async def _send(self, payload: Mapping[str, object]) -> None:
         process = self._process
@@ -819,7 +851,7 @@ class RaydiumLocalQuoteWorker:
             else:
                 self._late_simulation_results_dropped += 1
             return
-        if kind in {"snapshot_result", "simulate_path_result", "simulation_evidence_result"}:
+        if kind in {"snapshot_result", "simulate_path_result", "simulation_evidence_result", "worker_stats_result"}:
             request_id = message.get("request_id")
             if not isinstance(request_id, str):
                 self._fail(RuntimeError(f"quote worker {kind} has no request_id"))
@@ -856,6 +888,12 @@ class RaydiumLocalQuoteWorker:
                 self._ready.set_exception(failure)
                 return
             self._put_event(failure)
+            return
+        if kind == "worker_stats":
+            # The full stats dict is emitted directly via emitState.
+            # Store only the latest validated stats (must contain memory key).
+            if isinstance(message.get("memory"), dict):
+                self._latest_worker_stats = message
             return
         self._put_event(message)
 
