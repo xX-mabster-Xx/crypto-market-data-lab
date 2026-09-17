@@ -1,0 +1,249 @@
+diff --git a/src/market_data_lab/solana_quote_worker.py b/src/market_data_lab/solana_quote_worker.py
+index 414259b..10db1cb 100644
+--- a/src/market_data_lab/solana_quote_worker.py
++++ b/src/market_data_lab/solana_quote_worker.py
+@@ -354,16 +354,22 @@ class _BoundedWorkerEventQueue:
+     never evicts an unrelated pending key: the stdout reader waits until the
+     scanner consumes capacity. Messages without a safe stable key are lossless
+     and use the same bounded backpressure path.
++
++    ``try_put`` is synchronous so ``RaydiumLocalQuoteWorker._dispatch`` keeps
++    its existing synchronous contract. The real stdout reader falls back to
++    ``put`` and awaits it only when a new distinct key hits capacity.
+     """
+ 
+     def __init__(self, *, capacity: int) -> None:
+         if capacity <= 0:
+             raise ValueError("event queue capacity must be positive")
+         self.capacity = capacity
+-        self._condition = asyncio.Condition()
+         # dict preserves insertion order. Replacing an existing key updates the
+         # payload without moving a cold key behind a hot key.
+         self._pending: dict[object, dict[str, Any] | BaseException] = {}
++        self._not_empty = asyncio.Event()
++        self._not_full = asyncio.Event()
++        self._not_full.set()
+ 
+     @staticmethod
+     def _coalescing_key(item: dict[str, Any] | BaseException) -> tuple[str, ...] | None:
+@@ -386,30 +392,34 @@ class _BoundedWorkerEventQueue:
+             return ("refresh_health",)
+         return None
+ 
+-    async def put(self, item: dict[str, Any] | BaseException) -> None:
++    def try_put(self, item: dict[str, Any] | BaseException) -> bool:
+         key = self._coalescing_key(item)
+-        async with self._condition:
+-            while True:
+-                # Recheck after every wake-up: another producer may have added
+-                # the same key while this producer was waiting for capacity.
+-                if key is not None and key in self._pending:
+-                    self._pending[key] = item
+-                    return
+-                if len(self._pending) < self.capacity:
+-                    token: object = key if key is not None else object()
+-                    self._pending[token] = item
+-                    self._condition.notify_all()
+-                    return
+-                await self._condition.wait()
++        if key is not None and key in self._pending:
++            self._pending[key] = item
++            self._not_empty.set()
++            return True
++        if len(self._pending) >= self.capacity:
++            return False
++        token: object = key if key is not None else object()
++        self._pending[token] = item
++        self._not_empty.set()
++        if len(self._pending) >= self.capacity:
++            self._not_full.clear()
++        return True
++
++    async def put(self, item: dict[str, Any] | BaseException) -> None:
++        while not self.try_put(item):
++            await self._not_full.wait()
+ 
+     async def get(self) -> dict[str, Any] | BaseException:
+-        async with self._condition:
+-            while not self._pending:
+-                await self._condition.wait()
+-            token = next(iter(self._pending))
+-            item = self._pending.pop(token)
+-            self._condition.notify_all()
+-            return item
++        while not self._pending:
++            await self._not_empty.wait()
++        token = next(iter(self._pending))
++        item = self._pending.pop(token)
++        if not self._pending:
++            self._not_empty.clear()
++        self._not_full.set()
++        return item
+ 
+     def qsize(self) -> int:
+         return len(self._pending)
+@@ -846,20 +856,30 @@ class RaydiumLocalQuoteWorker:
+                 try:
+                     message = json.loads(line)
+                 except json.JSONDecodeError as exc:
+-                    await self._fail(RuntimeError(f"quote worker emitted invalid JSON: {exc}"))
++                    pending = self._fail(RuntimeError(f"quote worker emitted invalid JSON: {exc}"))
++                    if pending is not None:
++                        await pending
+                     return
+                 if not isinstance(message, dict):
+-                    await self._fail(RuntimeError("quote worker emitted a non-object JSON message"))
++                    pending = self._fail(RuntimeError("quote worker emitted a non-object JSON message"))
++                    if pending is not None:
++                        await pending
+                     return
+-                await self._dispatch(message)
++                pending = self._dispatch(message)
++                if pending is not None:
++                    await pending
+             if not self._closed:
+                 return_code = await process.wait()
+                 suffix = f"; stderr: {' | '.join(self._stderr_tail[-12:])}" if self._stderr_tail else ""
+-                await self._fail(RuntimeError(f"quote worker exited with code {return_code}{suffix}"))
++                pending = self._fail(RuntimeError(f"quote worker exited with code {return_code}{suffix}"))
++                if pending is not None:
++                    await pending
+         except asyncio.CancelledError:
+             raise
+         except Exception as exc:
+-            await self._fail(RuntimeError(f"quote worker stdout reader failed: {_redact_urls(str(exc))}"))
++            pending = self._fail(RuntimeError(f"quote worker stdout reader failed: {_redact_urls(str(exc))}"))
++            if pending is not None:
++                await pending
+ 
+     async def _read_stderr(self) -> None:
+         process = self._process
+@@ -874,7 +894,7 @@ class RaydiumLocalQuoteWorker:
+         except asyncio.CancelledError:
+             raise
+ 
+-    async def _dispatch(self, message: dict[str, Any]) -> None:
++    def _dispatch(self, message: dict[str, Any]) -> asyncio.Task[None] | None:
+         kind = message.get("type")
+         if kind == "ready":
+             if self._ready is not None and not self._ready.done():
+@@ -883,7 +903,7 @@ class RaydiumLocalQuoteWorker:
+         if kind == "quote_result":
+             request_id = message.get("request_id")
+             if not isinstance(request_id, str):
+-                await self._fail(RuntimeError("quote worker result has no request_id"))
++                self._fail(RuntimeError("quote worker result has no request_id"))
+                 return
+             future = self._pending_quotes.get(request_id)
+             if future is not None and not future.done():
+@@ -897,7 +917,7 @@ class RaydiumLocalQuoteWorker:
+         if kind == "cancel_simulation_result":
+             request_id = message.get("request_id")
+             if not isinstance(request_id, str):
+-                await self._fail(RuntimeError("quote worker cancellation result has no request_id"))
++                self._fail(RuntimeError("quote worker cancellation result has no request_id"))
+                 return
+             cancellation_future = self._pending_cancellations.get(request_id)
+             if cancellation_future is not None and not cancellation_future.done():
+@@ -920,7 +940,7 @@ class RaydiumLocalQuoteWorker:
+         if kind in {"snapshot_result", "simulate_path_result", "simulation_evidence_result", "worker_stats_result"}:
+             request_id = message.get("request_id")
+             if not isinstance(request_id, str):
+-                await self._fail(RuntimeError(f"quote worker {kind} has no request_id"))
++                self._fail(RuntimeError(f"quote worker {kind} has no request_id"))
+                 return
+             future = self._pending_simulations.get(request_id)
+             if future is not None and not future.done():
+@@ -953,17 +973,16 @@ class RaydiumLocalQuoteWorker:
+             if self._ready is not None and not self._ready.done():
+                 self._ready.set_exception(failure)
+                 return
+-            await self._put_event(failure)
+-            return
++            return self._put_event(failure)
+         if kind == "worker_stats":
+             # The full stats dict is emitted directly via emitState.
+             # Store only the latest validated stats (must contain memory key).
+             if isinstance(message.get("memory"), dict):
+                 self._latest_worker_stats = message
+             return
+-        await self._put_event(message)
++        return self._put_event(message)
+ 
+-    async def _fail(self, error: BaseException) -> None:
++    def _fail(self, error: BaseException) -> asyncio.Task[None] | None:
+         if self._ready is not None and not self._ready.done():
+             self._ready.set_exception(error)
+         # Set request futures before applying event-queue backpressure so a
+@@ -974,10 +993,18 @@ class RaydiumLocalQuoteWorker:
+         for future in self._pending_simulations.values():
+             if not future.done():
+                 future.set_exception(error)
+-        await self._put_event(error)
++        return self._put_event(error)
+ 
+-    async def _put_event(self, item: dict[str, Any] | BaseException) -> None:
+-        await self._events.put(item)
++    def _put_event(
++        self, item: dict[str, Any] | BaseException
++    ) -> asyncio.Task[None] | None:
++        if self._events.try_put(item):
++            return None
++        # Only saturation of a new distinct key gets here. Scheduling instead
++        # of returning a bare coroutine preserves the old synchronous dispatch
++        # API for tests/callers while the stdout reader can await this Task to
++        # apply real bounded backpressure.
++        return asyncio.create_task(self._events.put(item))
+ 
+ 
+ def build_argument_parser() -> argparse.ArgumentParser:
+diff --git a/tests/test_solana_worker_event_queue.py b/tests/test_solana_worker_event_queue.py
+index 5047890..672303b 100644
+--- a/tests/test_solana_worker_event_queue.py
++++ b/tests/test_solana_worker_event_queue.py
+@@ -72,3 +72,45 @@ class BoundedWorkerEventQueueTest(unittest.IsolatedAsyncioTestCase):
+ 
+ if __name__ == "__main__":
+     unittest.main()
++
++
++class WorkerDispatchCompatibilityTest(unittest.IsolatedAsyncioTestCase):
++    @staticmethod
++    def _worker(*, capacity: int = 2):
++        from market_data_lab.solana_quote_worker import QuoteWorkerPool
++        from market_data_lab.solana_quote_worker import RaydiumLocalQuoteWorker
++
++        return RaydiumLocalQuoteWorker(
++            rpc_http_url="http://localhost",
++            rpc_ws_url="ws://localhost",
++            pools=(QuoteWorkerPool("pool-a", "Pool A"),),
++            event_capacity=capacity,
++        )
++
++    async def test_control_dispatch_keeps_synchronous_contract(self) -> None:
++        worker = self._worker()
++        worker._dispatch({"type": "worker_stats", "memory": {"rss_bytes": 123}})
++        self.assertEqual(worker.latest_worker_stats["memory"]["rss_bytes"], 123)
++
++        future = asyncio.get_running_loop().create_future()
++        worker._pending_simulations["sim-1"] = future
++        result = worker._dispatch(
++            {"type": "simulate_path_result", "request_id": "sim-1", "status": "ok"}
++        )
++        self.assertIsNone(result)
++        self.assertTrue(future.done())
++        self.assertEqual(future.result()["status"], "ok")
++
++    async def test_dispatch_backpressures_only_for_new_distinct_key(self) -> None:
++        worker = self._worker(capacity=1)
++        self.assertIsNone(worker._dispatch(pool_state("A", 1)))
++
++        blocked = worker._dispatch(pool_state("B", 1))
++        self.assertIsInstance(blocked, asyncio.Task)
++        self.assertFalse(blocked.done())
++
++        first = await worker.next_event()
++        self.assertEqual(first["pool_id"], "A")
++        await asyncio.wait_for(blocked, timeout=0.5)
++        second = await worker.next_event()
++        self.assertEqual(second["pool_id"], "B")

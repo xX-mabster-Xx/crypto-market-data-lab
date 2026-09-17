@@ -1,0 +1,224 @@
+diff --git a/src/market_data_lab/solana_quote_worker.py b/src/market_data_lab/solana_quote_worker.py
+index 38bf29d..085f343 100644
+--- a/src/market_data_lab/solana_quote_worker.py
++++ b/src/market_data_lab/solana_quote_worker.py
+@@ -10 +10,3 @@ class RaydiumLocalQuoteWorker:
+-        self._events = asyncio.Queue(maxsize=event_capacity)
++        from market_data_lab.solana_worker_event_queue import SolanaWorkerEventQueue
++
++        self._events = SolanaWorkerEventQueue(maxsize=event_capacity)
+@@ -13 +15 @@ class RaydiumLocalQuoteWorker:
+-        self._put_event(item)
++        await self._put_event(item)
+@@ -15,6 +17,2 @@ class RaydiumLocalQuoteWorker:
+-    def _put_event(self, item: dict[str, Any]) -> None:
+-        if self._events.full():
+-            with suppress(asyncio.QueueEmpty):
+-                self._events.get_nowait()
+-        with suppress(asyncio.QueueFull):
+-            self._events.put_nowait(item)
++    async def _put_event(self, item: dict[str, Any]) -> None:
++        await self._events.put(item)
+diff --git a/src/market_data_lab/solana_worker_event_queue.py b/src/market_data_lab/solana_worker_event_queue.py
+new file mode 100644
+index 0000000..7e769de
+--- /dev/null
++++ b/src/market_data_lab/solana_worker_event_queue.py
+@@ -0,0 +1,97 @@
++from __future__ import annotations
++
++import asyncio
++from typing import Any
++
++
++class SolanaWorkerEventQueue:
++    """Bounded latest-state queue for unsolicited Solana worker events.
++
++    Replaceable state is coalesced by a stable logical key. A new distinct key
++    never evicts an unrelated pending key: producers wait for capacity instead.
++    Messages without a safe stable key are lossless and therefore also use
++    backpressure when the queue is full.
++    """
++
++    def __init__(self, *, maxsize: int) -> None:
++        if maxsize <= 0:
++            raise ValueError("event queue maxsize must be positive")
++        self.maxsize = maxsize
++        self._condition = asyncio.Condition()
++        # dict insertion order is the delivery order. Updating an existing key
++        # replaces its payload without moving it behind unrelated cold keys.
++        self._pending: dict[object, dict[str, Any]] = {}
++        self.coalesced_updates = 0
++        self.backpressure_waits = 0
++        self.high_watermark = 0
++
++    @staticmethod
++    def _coalescing_key(item: dict[str, Any]) -> tuple[str, ...] | None:
++        message_type = item.get("type")
++        if message_type == "pool_state":
++            protocol = item.get("protocol")
++            pool_id = item.get("pool_id")
++            if (
++                isinstance(protocol, str)
++                and protocol
++                and isinstance(pool_id, str)
++                and pool_id
++            ):
++                return ("pool_state", protocol, pool_id)
++            # A malformed state message must not accidentally alias another
++            # malformed message. Keep it lossless and let validation reject it.
++            return None
++        if message_type == "refresh_health":
++            return ("refresh_health",)
++        return None
++
++    async def put(self, item: dict[str, Any]) -> None:
++        key = self._coalescing_key(item)
++        waited = False
++        async with self._condition:
++            while True:
++                # Recheck after every wake-up. Another producer may have
++                # installed this key while this producer was waiting.
++                if key is not None and key in self._pending:
++                    self._pending[key] = item
++                    self.coalesced_updates += 1
++                    return
++
++                if len(self._pending) < self.maxsize:
++                    token: object = key if key is not None else object()
++                    self._pending[token] = item
++                    self.high_watermark = max(self.high_watermark, len(self._pending))
++                    self._condition.notify_all()
++                    return
++
++                if not waited:
++                    self.backpressure_waits += 1
++                    waited = True
++                await self._condition.wait()
++
++    async def get(self) -> dict[str, Any]:
++        async with self._condition:
++            while not self._pending:
++                await self._condition.wait()
++            token = next(iter(self._pending))
++            item = self._pending.pop(token)
++            self._condition.notify_all()
++            return item
++
++    def qsize(self) -> int:
++        return len(self._pending)
++
++    def empty(self) -> bool:
++        return not self._pending
++
++    def full(self) -> bool:
++        return len(self._pending) >= self.maxsize
++
++    def snapshot(self) -> dict[str, int]:
++        return {
++            "pending": len(self._pending),
++            "capacity": self.maxsize,
++            "coalesced_updates": self.coalesced_updates,
++            "backpressure_waits": self.backpressure_waits,
++            "high_watermark": self.high_watermark,
++        }
+diff --git a/tests/test_solana_worker_event_queue.py b/tests/test_solana_worker_event_queue.py
+new file mode 100644
+index 0000000..17c054f
+--- /dev/null
++++ b/tests/test_solana_worker_event_queue.py
+@@ -0,0 +1,94 @@
++from __future__ import annotations
++
++import asyncio
++import unittest
++
++from market_data_lab.solana_worker_event_queue import SolanaWorkerEventQueue
++
++
++def pool_state(pool_id: str, sequence: int) -> dict[str, object]:
++    return {
++        "type": "pool_state",
++        "protocol": "raydium_clmm",
++        "pool_id": pool_id,
++        "sequence": sequence,
++    }
++
++
++class SolanaWorkerEventQueueTest(unittest.IsolatedAsyncioTestCase):
++    async def test_hot_pool_cannot_evict_single_cold_pool_update(self) -> None:
++        queue = SolanaWorkerEventQueue(maxsize=2)
++        await queue.put(pool_state("cold", 1))
++        await queue.put(pool_state("hot", 1))
++
++        for sequence in range(2, 1_001):
++            await queue.put(pool_state("hot", sequence))
++
++        self.assertEqual(queue.qsize(), 2)
++        self.assertEqual(queue.coalesced_updates, 999)
++        self.assertEqual(queue.high_watermark, 2)
++
++        cold = await queue.get()
++        hot = await queue.get()
++        self.assertEqual(cold["pool_id"], "cold")
++        self.assertEqual(cold["sequence"], 1)
++        self.assertEqual(hot["pool_id"], "hot")
++        self.assertEqual(hot["sequence"], 1_000)
++
++    async def test_new_distinct_key_backpressures_until_capacity_is_free(self) -> None:
++        queue = SolanaWorkerEventQueue(maxsize=1)
++        await queue.put(pool_state("A", 1))
++
++        blocked = asyncio.create_task(queue.put(pool_state("B", 1)))
++        await asyncio.sleep(0)
++        self.assertFalse(blocked.done())
++        self.assertEqual(queue.backpressure_waits, 1)
++
++        first = await queue.get()
++        self.assertEqual(first["pool_id"], "A")
++        await asyncio.wait_for(blocked, timeout=0.5)
++        second = await queue.get()
++        self.assertEqual(second["pool_id"], "B")
++
++    async def test_waiting_same_key_rechecks_and_coalesces(self) -> None:
++        queue = SolanaWorkerEventQueue(maxsize=1)
++        await queue.put(pool_state("A", 1))
++
++        first_b = asyncio.create_task(queue.put(pool_state("B", 1)))
++        await asyncio.sleep(0)
++        self.assertFalse(first_b.done())
++
++        await queue.get()
++        await asyncio.wait_for(first_b, timeout=0.5)
++        await queue.put(pool_state("B", 2))
++
++        only = await queue.get()
++        self.assertEqual(only["pool_id"], "B")
++        self.assertEqual(only["sequence"], 2)
++
++    async def test_refresh_health_is_latest_only(self) -> None:
++        queue = SolanaWorkerEventQueue(maxsize=1)
++        await queue.put({"type": "refresh_health", "status": "degraded"})
++        await queue.put({"type": "refresh_health", "status": "healthy"})
++
++        self.assertEqual(queue.qsize(), 1)
++        item = await queue.get()
++        self.assertEqual(item["status"], "healthy")
++
++    async def test_unkeyed_messages_are_lossless_and_backpressured(self) -> None:
++        queue = SolanaWorkerEventQueue(maxsize=1)
++        first = {"type": "error", "message": "first"}
++        second = {"type": "error", "message": "second"}
++        await queue.put(first)
++
++        blocked = asyncio.create_task(queue.put(second))
++        await asyncio.sleep(0)
++        self.assertFalse(blocked.done())
++
++        self.assertEqual(await queue.get(), first)
++        await asyncio.wait_for(blocked, timeout=0.5)
++        self.assertEqual(await queue.get(), second)
++
++
++if __name__ == "__main__":
++    unittest.main()
